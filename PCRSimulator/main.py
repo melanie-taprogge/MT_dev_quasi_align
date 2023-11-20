@@ -10,6 +10,7 @@ import qrng
 import torch
 import torchvision
 from Bio import SeqIO
+import argparse
 
 
 @ray.remote
@@ -80,6 +81,39 @@ def get_quantum_random_numbers(n=1, lower_bound=0, upper_bound=100):
     return [(int(i) % (upper_bound - lower_bound + 1)) + lower_bound for i in integers]
 
 
+class DNAMolecule:
+    def __init__(self, forward_strand, reverse_strand):
+        self.forward_strand = forward_strand  # the 5' to 3' strand
+        self.reverse_strand = reverse_strand  # the complementary 3' to 5' strand
+        self.is_double_stranded = True
+
+    def denature(self):
+        # A probability of incomplete denaturation
+        if random.random() < 0.95:  # 95% chance of denaturation
+            self.is_double_stranded = False
+
+    def anneal(self, primer, current_temp):
+        # Calculate the effect of temperature on binding
+        temp_factor = 1 - abs(primer.optimal_temp - current_temp) / primer.optimal_temp
+
+        # Check for binding with mismatches on forward strand
+        if self._check_binding(self.forward_strand, primer, temp_factor):
+            self.is_double_stranded = True
+            return True
+        # Check for binding with mismatches on reverse strand
+        elif self._check_binding(self.reverse_strand, primer, temp_factor):
+            self.is_double_stranded = True
+            return True
+        return False
+
+    def _check_binding(self, strand, primer, temp_factor):
+        # Simple mismatch count - can be replaced with a more complex algorithm
+        mismatch_count = sum(1 for a, b in zip(strand, primer.sequence) if a != b)
+        if mismatch_count <= primer.mismatch_tolerance and temp_factor > 0.5:
+            return True
+        return False
+
+
 class Primer:
     def __init__(self, sequence, tm, gc_content, position, specificity=None):
         """
@@ -94,6 +128,7 @@ class Primer:
         self.gc_content = gc_content
         self.position = position
         self.specificity = specificity
+        self.is_bound = False
 
     def display(self):
         """Displays basic primer information."""
@@ -109,6 +144,9 @@ class Primer:
         else:
             # Handle failed binding logic
             pass
+
+    def denature(self):
+        self.is_bound = False
 
 
 class Genome:
@@ -262,9 +300,10 @@ class AdvancedSpecificityTest(PrimerSpecificityStrategy):
 
 
 class PCR:
-    def __init__(self, primers, genomes):
+    def __init__(self, primers, genomes, dna_molecules):
         self.primers = primers
         self.genomes = genomes
+        self.dna_molecules = dna_molecules
         self.observers = []
 
     def register_observer(self, observer):
@@ -278,15 +317,21 @@ class PCR:
             observer.update(event)
 
     def denature(self):
-        # Simplified denature logic
-        pass
+        for dna_molecule in self.dna_molecules:
+            dna_molecule.denature()
+
+        for primer in primers:
+            primer.denature()
+
 
     def anneal(self):
-        for primer in self.primers:
-            for genome in self.genomes:
-                primer.bind(genome)
-                # Notify observers about the binding event
-                # self.notify_observers(f"Primer {primer.sequence} tried to bind to genome")
+        for dna_molecule in self.dna_molecules:
+            for primer in self.primers:
+                for genome in self.genomes:
+                    primer.bind(genome)
+                    # Notify observers about the binding event
+                    # self.notify_observers(f"Primer {primer.sequence} tried to bind to genome")
+
 
     def extend(self):
         # Simplified extend logic
@@ -327,6 +372,19 @@ if __name__ == '__main__':
     ray.init()
 
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+
+    parser = argparse.ArgumentParser(description='PCR Simulator')
+
+    parser.add_argument('--primers', type=str, required=True, help='Path to the primers FASTA file')
+    parser.add_argument('--genomes', type=str, required=True, help='Path to the genomes FASTA file')
+    parser.add_argument('--denaturation_temp', type=float, required=True, help='Denaturation temperature in °C')
+    parser.add_argument('--annealing_temp', type=float, required=True, help='Annealing temperature in °C')
+    parser.add_argument('--extension_temp', type=float, required=True, help='Extension temperature in °C')
+    parser.add_argument('--denaturation_time', type=int, required=True, help='Denaturation time in seconds')
+    parser.add_argument('--annealing_time', type=int, required=True, help='Annealing time in seconds')
+    parser.add_argument('--extension_time', type=int, required=True, help='Extension time in seconds')
+
+    args = parser.parse_args()
 
     primer_path = "primers.fasta"
     primers = read_primers_from_fasta(primer_path)
