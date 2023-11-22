@@ -11,6 +11,8 @@ import torch
 import torchvision
 from Bio import SeqIO
 import argparse
+from abc import ABC, abstractmethod
+import random
 
 
 @ray.remote
@@ -87,14 +89,14 @@ class DNAMolecule:
         self.reverse_strand = reverse_strand  # the complementary 3' to 5' strand
         self.is_double_stranded = True
 
-    def denature(self):
+    def denature(self, denaturation_temp, denaturation_time):
         # A probability of incomplete denaturation
         if random.random() < 0.95:  # 95% chance of denaturation
             self.is_double_stranded = False
 
-    def anneal(self, primer, current_temp):
+    def anneal(self, primer, annealing_temp, annealing_time):
         # Calculate the effect of temperature on binding
-        temp_factor = 1 - abs(primer.optimal_temp - current_temp) / primer.optimal_temp
+        temp_factor = 1 - abs(primer.optimal_temp - annealing_temp) / primer.optimal_temp
 
         # Check for binding with mismatches on forward strand
         if self._check_binding(self.forward_strand, primer, temp_factor):
@@ -112,6 +114,24 @@ class DNAMolecule:
         if mismatch_count <= primer.mismatch_tolerance and temp_factor > 0.5:
             return True
         return False
+
+    def extend(self, polymerase, extension_temp, extension_time):
+        if not self.is_double_stranded:
+            return False
+
+        # Calculate extension length for this cycle
+        extension_length = polymerase.extension_speed * extension_time
+
+        # Check if the template is long enough for this extension
+        if len(self.forward_strand) < extension_length:
+            # If not, extend as much as possible
+            extension_length = len(self.forward_strand)
+
+        new_strand = self.forward_strand[:extension_length]
+
+        # Update the forward strand to include the new extension
+        self.forward_strand = new_strand
+        return True
 
 
 class Primer:
@@ -206,7 +226,7 @@ class Genome:
 
 
 class Polymerase:
-    def __init__(self, name, elongation_speed, temperature_optimum, proofreading_efficiency=0.0, amplifiable_range=(0, 1000), inhibitor_tolerance):
+    def __init__(self, name, elongation_speed, temperature_optimum, inhibitor_tolerance, proofreading_efficiency=0.0, amplifiable_range=(0, 1000)):
         self.name = name
         self.elongation_speed = elongation_speed  # nucleotides per second
         self.temperature_optimum = temperature_optimum  # optimum temperature for activity
@@ -280,7 +300,7 @@ class Polymerase:
 # class EventListener:
 #     pass
 
-from abc import ABC, abstractmethod
+
 
 # Strategy interface for primer specificity check
 class PrimerSpecificityStrategy(ABC):
@@ -300,10 +320,11 @@ class AdvancedSpecificityTest(PrimerSpecificityStrategy):
 
 
 class PCR:
-    def __init__(self, primers, genomes, dna_molecules):
+    def __init__(self, dna_pool, primers, polymerase, cycle_settings):
+        self.dna_pool = dna_pool
         self.primers = primers
-        self.genomes = genomes
-        self.dna_molecules = dna_molecules
+        self.polymerase = polymerase
+        self.cycle_settings = cycle_settings
         self.observers = []
 
     def register_observer(self, observer):
@@ -316,31 +337,31 @@ class PCR:
         for observer in self.observers:
             observer.update(event)
 
-    def denature(self):
-        for dna_molecule in self.dna_molecules:
-            dna_molecule.denature()
+    def denature(self, denaturation_temp, denaturation_time):
+        for dna_molecule in self.dna_pool:
+            # dna_molecule.denature()
+            pass
 
         for primer in primers:
-            primer.denature()
+            # primer.denature()
+            pass
 
-
-    def anneal(self):
-        for dna_molecule in self.dna_molecules:
+    def anneal(self, primers, annealing_temp, annealing_time):
+        for dna_molecule in self.dna_pool:
             for primer in self.primers:
-                for genome in self.genomes:
-                    primer.bind(genome)
+                    primer.bind(dna_molecule)
                     # Notify observers about the binding event
                     # self.notify_observers(f"Primer {primer.sequence} tried to bind to genome")
 
-
-    def extend(self):
-        # Simplified extend logic
-        pass
+    def extend(self, polymerase, extension_time, extension_temp):
+        for dna_molecule in self.dna_pool:
+            dna_molecule.extend(polymerase)
 
     def cycle(self):
-        self.denature()
-        self.anneal()
-        self.extend()
+        for _ in range(cycle_settings['num_cycles']):
+                self.denature(cycle_settings['denaturation_temp'], cycle_settings['denaturation_time'])
+                self.anneal(self.primers, cycle_settings['annealing_temp'], cycle_settings['annealing_time'])
+                self.extend(self.polymerase, cycle_settings['extension_time'], cycle_settings['extension_temp'])
 
 
 class PCRObserver:
@@ -366,6 +387,13 @@ class PCRObserver:
 #     def batch_process(self):
 #         pass
 
+# Function to create initial pool of DNA molecules
+def create_dna_pool(genomes, copies_per_genome):
+    pool = []
+    for genome in genomes:
+        for _ in range(copies_per_genome):
+            pool.append(DNAMolecule(genome.forward_strand, genome.reverse_strand))
+    return pool
 
 if __name__ == '__main__':
 
@@ -403,9 +431,13 @@ if __name__ == '__main__':
     observer = PCRObserver()
     pcr.register_observer(observer)
 
-    # Simulate PCR cycles
-    num_cycles = 30
-    for i in range(num_cycles):
-        pcr.cycle()
+    cycle_settings = {
+        'num_cycles': 30,
+        'denaturation_temp': 95, 'denaturation_time': 30,
+        'annealing_temp': 55, 'annealing_time': 45,
+        'extension_temp': 72, 'extension_time': 60
+    }
+
+    pcr.cycle()
 
     ray.shutdown()
