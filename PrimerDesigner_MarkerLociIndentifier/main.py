@@ -472,6 +472,34 @@ class MarkerLociIdentificationStrategy(Strategy):
             x = self.fc(x)
             return x
 
+    class _GenomicTransformer(nn.Module):
+        def __init__(self, embedding_size, nhead, num_layers, num_classes):
+            super().__init__()
+            config = BertConfig(
+                hidden_size=embedding_size,
+                num_attention_heads=nhead,
+                num_hidden_layers=num_layers,
+            )
+            self.transformer = BertModel(config)
+            self.fc = nn.Linear(embedding_size, num_classes)  # Final classification layer
+
+        def forward(self, x):
+            # x: [batch_size, seq_len, embedding_size]
+    
+            # Adjust x to match BERT input dimensions
+            x = x.permute(1, 0, 2)  # BERT expects [seq_len, batch_size, embedding_size]
+
+            # Get transformer outputs (last hidden state and attentions)
+            outputs = self.transformer(x, output_attentions=True)
+            hidden_state = outputs.last_hidden_state
+            attentions = outputs.attentions
+
+            # Aggregate over sequence and pass through the classification layer
+            aggregated_output = hidden_state.mean(dim=1)
+            logits = self.fc(aggregated_output)
+
+            return logits, attentions
+
     class _TrainGenomicTransformer(Trainable):
         def _setup(self, config):
             # Model and optimizer initialization
@@ -507,7 +535,7 @@ class MarkerLociIdentificationStrategy(Strategy):
             dataset = TensorDataset(features_padded, labels)
             return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-        def _train(self):
+         def _train(self):
             num_epochs = self.config.get("num_epochs", 10)
 
             for epoch in range(num_epochs):
@@ -531,20 +559,23 @@ class MarkerLociIdentificationStrategy(Strategy):
                 avg_train_loss = total_train_loss / len(self.train_loader)
                 avg_train_accuracy = total_train_accuracy / len(self.train_loader)
 
-                # Validation phase
+                # Validation phase with attention weights collection
                 self.model.eval()
                 total_val_loss, total_val_accuracy = 0, 0
                 with torch.no_grad():
                     for batch in self.val_loader:
                         inputs = batch[0].to(self.device)
                         labels = batch[1].to(self.device)
-                        outputs = self.model(inputs)
+                        outputs, attentions = self.model(inputs)  # Get outputs and attention weights
                         loss = self.criterion(outputs, labels)
                         total_val_loss += loss.item()
 
                         # Calculate accuracy
                         predicted = torch.argmax(outputs, dim=1)
                         total_val_accuracy += accuracy_score(labels.cpu(), predicted.cpu())
+
+                        # Collect attention weights for analysis
+                        collected_attention_weights.append(attentions)
 
                 avg_val_loss = total_val_loss / len(self.val_loader)
                 avg_val_accuracy = total_val_accuracy / len(self.val_loader)
@@ -555,7 +586,9 @@ class MarkerLociIdentificationStrategy(Strategy):
 
             return {"train_loss": avg_train_loss, "train_accuracy": avg_train_accuracy,
                     "val_loss": avg_val_loss, "val_accuracy": avg_val_accuracy}
-
+        
+        def analyze_attention_weights(self, attention_weights):
+            pass
 
     def __init__(self, input_file, feature_extractor):
         self._input_file = input_file
