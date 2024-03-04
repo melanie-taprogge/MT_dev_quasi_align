@@ -24,7 +24,17 @@ import os
 from gensim.models import Word2Vec
 from hyperopt import hp
 from ray.tune.suggest.hyperopt import HyperOptSearch
-
+import glob
+import psycopg2
+from psycopg2 import sql
+from psycopg2.extensions import ISOLATION_LEVEL_AUTOCOMMIT
+from Bio import AlignIO
+from Bio.Align.Applications import ClustalwCommandline, MafftCommandline, MuscleCommandline, PrankCommandline
+from Bio import SeqIO
+from Bio.Align import AlignInfo
+from tempfile import NamedTemporaryFile
+import re
+from Bio import Entrez
 
 # Parsing the input FASTA file to a dictionary
 def parse_fasta_to_dict(fasta_file):
@@ -52,6 +62,68 @@ def parse_fasta_by_amplicons(fasta_file):
             amplicon_dict[identifier][record.id] = str(record.seq)
 
     return amplicon_dict
+
+
+def extract_info_multiFASTA(header):
+    """
+    Extract the genome name and ID in the headers of FASTA files in the format of BV-BRC
+    """
+
+    # Definition of a regular expression to match the genome name and ID in FASTA files from BV-BRC
+    pattern = r'\[([^\|]+) \| ([^\]]+)\]'
+
+    # Match the header with the defined regular expression
+    match = re.search(pattern, header)
+
+    # Check if a match is found
+    if match:
+        # Extract and return Genome_Name and Genome_ID
+        genome_name = match.group(1)
+        genome_id = match.group(2)
+        return genome_name, genome_id
+    else:
+        return None, None
+
+
+def read_multifasta(file_path):
+    """
+    Read in Multi-FASTA files and write Genome Name, ID and sequence to a pandas dataframe
+    """
+
+    # Initialize an empty DataFrame with column names
+    # columns = ['Genome Name', 'Genome ID', 'Sequence']
+    gene_df = pd.DataFrame(columns=['genome_name', 'genome_id', 'sequence'])
+
+    with open(file_path, 'r') as file:
+        current_header = None
+        current_sequence = ""
+
+        for line in file:
+
+            if line.startswith('>'):
+                # The lines starting with > are the headers
+
+                # If data has already been read in, we need to safe it to the data frame before defining the newly read header as "current_header"
+                if current_header is not None:
+                    genome_name, genome_id = extract_info_multiFASTA(current_header)
+                    new_entry = {'genome_name': genome_name, 'genome_id': genome_id, 'sequence': current_sequence}
+                    gene_df = gene_df.append(new_entry, ignore_index=True)
+                    # reset the current_sequence
+                    current_sequence = ""
+
+                # Set the current_header to the newly read header line
+                current_header = line[1:]
+            else:
+                # Add the sequence line to the sequence
+                current_sequence += line.rstrip('\n')
+
+        # Process the last sequence after the loop ends
+        if current_header is not None:
+            genome_name, genome_id = extract_info_multiFASTA(current_header)
+            new_entry = {'genome_name': genome_name, 'genome_id': genome_id, 'sequence': current_sequence}
+            gene_df = gene_df.append(new_entry, ignore_index=True)
+
+    return gene_df
 
 
 # Convert parameters to the correct type
@@ -411,6 +483,947 @@ class TargetedAmpliconSequencingStrategy(Strategy):
 
 
 class MarkerLociIdentificationStrategy(Strategy):
+    def __init__(self):
+        # Initialize the candidate_species_markers attribute as an empty DataFrame
+        self.candidate_species_markers = pd.DataFrame(columns=['species', 'consensusSequence', 'start', 'end'])
+        self.species_markers = pd.DataFrame(columns=['species', 'consensusSequence', 'start', 'end'])
+        self.coverage_matrix = pd.DataFrame()
+        # Initialize an empty list to store the selected markers
+        self.selected_markers = []
+        # Initialize a dictionary to indicate species without markers
+        self.species_without_markers = {}
+
+    def run_cactus(self, config_path, seq_file_paths, output_dir):
+        """
+        Runs the Cactus program with the given configuration, sequence files, and output directory.
+
+        :param config_path: Path to the Cactus configuration file.
+        :param seq_file_paths: A list of paths to the input sequence files.
+        :param output_dir: The directory where the aligned genome will be saved.
+        """
+        # Join the sequence file paths into a space-separated string
+        seq_files_str = " ".join(seq_file_paths)
+
+        # Construct the Cactus command
+        cactus_cmd = f"cactus {output_dir} {config_path} {seq_files_str} --realTimeLogging"
+
+        try:
+            # Execute the Cactus command
+            subprocess.run(cactus_cmd, shell=True, check=True)
+            print("Cactus alignment completed successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"Error running Cactus: {e}")
+
+    def sliding_window_analysis(self, genomes_dict, reference_fasta, output_folder, window_size, step_size, threshold=0.95):
+        """
+        Performs a sliding window analysis over genomic alignments.
+
+        Parameters:
+        - genomes_dict: Dictionary with keys as species names and values as genomic sequences.
+        - reference_fasta: Path to the reference database in fasta format.
+        - output_folder: Base folder for Minimap2 output.
+        - window_size: Size of the window to test.
+        - step_size: Step size for moving the window.
+        - threshold: Threshold for evaluating species identification reliability.
+
+        Returns:
+        - List of tuples, each representing a tested window with (start_position, window_length, proportion_reliable_species).
+        """
+        windows_results = []
+        for start_pos in range(0, len(genomes_dict), step_size):
+            window_genomes = {species: seq[start_pos:start_pos + window_size] for species, seq in genomes_dict.items()}
+            minimap2_output_folder = os.path.join(output_folder, f"window_{start_pos}_{window_size}")
+            os.makedirs(minimap2_output_folder, exist_ok=True)
+
+            # Run Minimap2 for each window
+            run_minimap2(window_genomes, reference_fasta, minimap2_output_folder)
+
+            # Process Minimap2 output and calculate identity, filter, and evaluate
+            species_results = {}
+            for species, _ in window_genomes.items():
+                paf_file = os.path.join(minimap2_output_folder, f"{species}_alignment.paf")
+                filtered_hits = calculate_identity_and_filter(paf_file, species)
+                species_results[species] = filtered_hits
+
+            proportion_reliable_species = evaluate_species_identification_proportion(species_results, threshold)
+
+            # Save the window results
+            windows_results.append((start_pos, window_size, proportion_reliable_species))
+
+        return windows_results
+
+    def initialize_db(self, user, password):
+        # Parameters
+        db_params = {
+            "dbname": "postgres",
+            "user": user,
+            "password": password,
+            "host": "localhost"
+        }
+
+        # Connect to the existing 'postgres' database
+        conn = psycopg2.connect(**db_params)
+        conn.set_isolation_level(ISOLATION_LEVEL_AUTOCOMMIT)
+
+        # Create a new database
+        cur = conn.cursor()
+        cur.execute(sql.SQL("CREATE DATABASE {};").format(sql.Identifier('genomics_db')))
+
+        cur.close()
+        conn.close()
+
+        # Update db_params to connect to the new database
+        db_params["dbname"] = "genomics_db"
+
+        # Connect to the new database
+        conn = psycopg2.connect(**db_params)
+        cur = conn.cursor()
+
+        # SQL command to create a table
+        create_table_command = """
+        CREATE TABLE annotated_genes (
+            gene_id SERIAL PRIMARY KEY,
+            species VARCHAR(255),
+            gene_name VARCHAR(255),
+            sequence TEXT,
+            annotation TEXT,
+            category VARCHAR(255)  -- e.g., 'single-copy', 'core', 'accessory'
+        );
+        """
+
+        # Execute the command
+        cur.execute(create_table_command)
+        conn.commit()
+
+        # Clean up
+        cur.close()
+        conn.close()
+
+    def run_prokka_and_panaroo(self, genome_paths, output_dir):
+        """
+        Annotates genomes with Prokka and performs pan-genome analysis with Panaroo.
+
+        Parameters:
+        - genome_paths: List of paths to genome files in FASTA format.
+        - output_dir: Base directory for output files. Subdirectories will be created for Prokka and Panaroo outputs.
+        """
+        # Ensure output directories exist
+        prokka_output_dir = os.path.join(output_dir, "prokka")
+        panaroo_output_dir = os.path.join(output_dir, "panaroo")
+        os.makedirs(prokka_output_dir, exist_ok=True)
+        os.makedirs(panaroo_output_dir, exist_ok=True)
+
+        # Run Prokka for each genome
+        prokka_outputs = []  # To collect paths to Prokka output directories
+        for genome_path in genome_paths:
+            genome_base_name = os.path.basename(genome_path).replace('.fasta', '')
+            prokka_out_dir = os.path.join(prokka_output_dir, genome_base_name)
+            prokka_cmd = [
+                'prokka', '--outdir', prokka_out_dir, '--prefix', genome_base_name,
+                genome_path
+            ]
+            subprocess.run(prokka_cmd, check=True)
+            prokka_outputs.append(prokka_out_dir)
+
+        # Prepare Panaroo input (list of annotated genome directories)
+        gff_paths = [os.path.join(dir, f"{os.path.basename(dir)}.gff") for dir in prokka_outputs]
+        panaroo_cmd = ['panaroo', '-i'] + gff_paths + ['-o', panaroo_output_dir, '--clean-mode', 'strict']
+
+        # Run Panaroo
+        subprocess.run(panaroo_cmd, check=True)
+
+    def run_pgap(self, genome_paths, output_dir, pgap_version='2021-07-01.build5508', container_runtime='docker'):
+        """
+        Annotates genomes using the NCBI Prokaryotic Genome Annotation Pipeline (PGAP).
+
+        Parameters:
+        - genome_paths: List of paths to genome files in FASTA format.
+        - output_dir: Base directory for output files. Subdirectories will be created for PGAP outputs.
+        - pgap_version: The version of PGAP to use, corresponding to the PGAP image version.
+        - container_runtime: The container runtime to use ('docker' or 'singularity').
+        """
+        # Ensure output directory exists
+        pgap_output_dir = os.path.join(output_dir, "pgap")
+        os.makedirs(pgap_output_dir, exist_ok=True)
+
+        # Run PGAP for each genome
+        for genome_path in genome_paths:
+            genome_base_name = os.path.basename(genome_path).replace('.fasta', '')
+            output_subdir = os.path.join(pgap_output_dir, genome_base_name)
+            os.makedirs(output_subdir, exist_ok=True)
+
+            # Prepare YAML input file for PGAP
+            yaml_input_path = os.path.join(output_subdir, f"{genome_base_name}.yaml")
+            self.prepare_pgap_input_yaml(genome_path, yaml_input_path)
+
+            if container_runtime == 'docker':
+                pgap_cmd = [
+                    'docker', 'run', '--rm', '-v', f"{output_subdir}:/pgap/output", '-v',
+                    f"{genome_path}:/pgap/input:ro",
+                    f"ncbi/pgap:{pgap_version}", 'cwltool', '--outdir', '/pgap/output', '/pgap/pgap.cwl',
+                    '/pgap/input/pgap_input.yaml'
+                ]
+            elif container_runtime == 'singularity':
+                singularity_image_path = f"ncbi-pgap-{pgap_version}.sif"
+                pgap_cmd = [
+                    'singularity', 'exec', '--bind', f"{output_subdir}:/pgap/output", '--bind',
+                    f"{genome_path}:/pgap/input:ro",
+                    singularity_image_path, 'cwltool', '--outdir', '/pgap/output', '/pgap/pgap.cwl',
+                    '/pgap/input/pgap_input.yaml'
+                ]
+            else:
+                raise ValueError("Invalid container_runtime specified. Use 'docker' or 'singularity'.")
+
+            # Run PGAP
+            subprocess.run(pgap_cmd, check=True)
+
+    def prepare_pgap_input_yaml(self, genome_path, yaml_input_path):
+        """
+        Prepares the input YAML file required by PGAP.
+
+        Parameters:
+        - genome_path: Path to the genome file in FASTA format.
+        - yaml_input_path: Path where the input YAML file for PGAP should be saved.
+        """
+
+        yaml_content = f"""
+    fasta:
+      - {genome_path}
+    submol:
+      - name: "Example"
+        strain: "Generic Strain"
+    """
+        with open(yaml_input_path, 'w') as file:
+            file.write(yaml_content)
+
+    def check_ncbi_annotations(self, species_name, email):
+        Entrez.email = email
+        search_handle = Entrez.esearch(db="genome", term=species_name, retmax=10)
+        search_results = Entrez.read(search_handle)
+        search_handle.close()
+
+        return bool(search_results["IdList"])
+
+    def download_genome_annotation(self, accession, email, output_file):
+        """
+        Downloads genome annotation for a given accession number and saves it to a file.
+
+        Parameters:
+        - accession: The accession number of the genome.
+        - email: Your email address (used when accessing NCBI's E-utilities).
+        - output_file: The file path where the genome annotation should be saved.
+        """
+        Entrez.email = email
+        try:
+            # Fetch the genome annotation from NCBI
+            handle = Entrez.efetch(db="nucleotide", id=accession, rettype="gbwithparts", retmode="text")
+            annotation_data = handle.read()
+            handle.close()
+
+            # Save the annotation data to a file
+            with open(output_file, 'w') as file:
+                file.write(annotation_data)
+            print(f"Genome annotation for {accession} saved to {output_file}")
+        except Exception as e:
+            print(f"An error occurred while downloading the annotation: {e}")
+
+    def extract_species_from_filename(self, genome_path):
+        """
+        Extracts the species name from a genome file path, assuming the file name contains the genus and species
+        separated by an underscore, followed by an optional strain identifier and the .fasta extension.
+
+        Example filename: "Escherichia_coli_strain_xyz.fasta" -> "Escherichia coli"
+
+        Parameters:
+        - genome_path: The file path of the genome in FASTA format.
+
+        Returns:
+        - The species name extracted from the file name.
+        """
+        filename = os.path.basename(genome_path)
+        # Remove the .fasta extension and split the remaining name by underscores
+        parts = filename.replace('.fasta', '').split('_')
+        # The species name consists of the first two parts (genus and species)
+        species_name = ' '.join(parts[:2])
+        return species_name
+
+    def process_genome(self, genome_path, output_dir, accession, email, annotation_method='prokka', pgap_version='2021-07-01.build5508',
+                       container_runtime='docker'):
+        """
+        Decides whether to download the genome or annotate it using Prokka and Panaroo or PGAP based on the existence of NCBI annotations.
+
+        Parameters:
+        - genome_path: Path to the genome file in FASTA format (or a list of paths).
+        - output_dir: Base directory for output files.
+        - annotation_method: Specify 'prokka' for Prokka+Panaroo or 'pgap' for PGAP.
+        - pgap_version: The version of PGAP to use (if PGAP is chosen).
+        - container_runtime: The container runtime to use ('docker' or 'singularity') if PGAP is chosen.
+        """
+        species_name = self.extract_species_from_filename(genome_path)
+        if check_ncbi_annotations(species_name):
+            download_genome_annotation(accession, email, output_dir)
+        else:
+            print(f"No annotations found for {species_name}. Proceeding with local annotation.")
+            if annotation_method == 'prokka':
+                run_prokka_and_panaroo(genome_path, output_dir)
+            elif annotation_method == 'pgap':
+                run_pgap(genome_path, output_dir, pgap_version, container_runtime)
+            else:
+                raise ValueError(f"Invalid annotation method: {annotation_method}")
+
+    def extract_single_copy_genes(self, genome_paths, output_dir):
+        # Load the gene_presence_absence.csv file
+        gpa_df = pd.read_csv('path/to/panaroo/output/gene_presence_absence.csv')
+
+        # Filter for single-copy core genes
+        presence_columns = gpa_df.columns[4:]  # Adjust based on your file
+        single_copy_core_genes = gpa_df.loc[(gpa_df[presence_columns] != '').sum(axis=1) == len(presence_columns)]
+
+        # Save the filtered genes to a new file
+        single_copy_core_genes.to_csv('path/to/output/single_copy_core_genes.csv', index=False)
+
+    def align_sequences(self, input_file, alignment_tool='prank', output_format='fasta'):
+        """
+        Align sequences using a specified alignment tool.
+
+        Parameters:
+        - input_file: Path to the input FASTA file.
+        - alignment_tool: The alignment tool to use ('clustalw', 'muscle', 'mafft', 'prank').
+        - output_format: Format of the output alignment.
+
+        Returns:
+        - Path to the output alignment file.
+        """
+        output_file = f"{input_file.rsplit('.', 1)[0]}_{alignment_tool}.aln"
+
+        if alignment_tool.lower() == 'clustalw':
+            clustalw_cline = ClustalwCommandline("clustalw2", infile=input_file, outfile=output_file)
+            stdout, stderr = clustalw_cline()
+
+        elif alignment_tool.lower() == 'muscle':
+            muscle_cline = MuscleCommandline(input=input_file, out=output_file)
+            stdout, stderr = muscle_cline()
+
+        elif alignment_tool.lower() == 'mafft':
+            mafft_cline = MafftCommandline(input=input_file)
+            stdout, stderr, = subprocess.Popen(str(mafft_cline),
+                                               stdout=subprocess.PIPE,
+                                               stderr=subprocess.PIPE,
+                                               shell=True,
+                                               text=True).communicate()
+            with open(output_file, 'w') as f:
+                f.write(stdout)
+
+        elif alignment_tool.lower() == 'prank':
+            prank_cline = PrankCommandline(d=input_file, o=output_file.rsplit('.', 1)[0])
+            prank_cline()
+
+        else:
+            raise ValueError("Unsupported alignment tool. Choose 'clustalw', 'muscle', 'mafft', or 'prank'.")
+
+        return output_file
+
+    def save_single_copy_genes_to_fasta(self, output_file):
+        conn = psycopg2.connect("dbname=genomics_db user=your_username")
+        cur = conn.cursor()
+        cur.execute("SELECT species, gene_name, sequence FROM annotated_genes WHERE category = 'single-copy'")
+
+        with open(output_file, 'w') as fasta_file:
+            for record in cur.fetchall():
+                species, gene_name, sequence = record
+                fasta_file.write(f'>{species}_{gene_name}\n{sequence}\n')
+
+        cur.close()
+        conn.close()
+
+    def alignment_to_dataframe(self, alignment_file, format='fasta'):
+        """
+        Converts an alignment file into a simple Pandas DataFrame with two columns:
+        'SeqName' for the sequence name and 'Seq' for the sequence itself.
+
+        Parameters:
+        - alignment_file: Alignment - Path to the alignment file.
+        - format: Format of the alignment file (default 'fasta').
+
+        Returns:
+        - A Pandas DataFrame with 'SeqName' and 'Seq' columns.
+        """
+        # Read the alignment
+        alignment = AlignIO.read(alignment_file, format)
+
+        # Initialize an empty list to store sequence name and sequence data
+        sequence_data = []
+
+        # Loop through each record in the alignment
+        for record in alignment:
+            # Append a tuple with the sequence name (identifier) and the sequence
+            sequence_data.append((record.id, str(record.seq)))
+
+        # Create a DataFrame from the sequence data
+        df = pd.DataFrame(sequence_data, columns=['SeqName', 'Seq'])
+
+        return df
+
+    def get_consensus_sequence_from_alignment(self, alignment_file, consensus_threshold=0.7):
+        """
+        Generates a consensus sequence from a given alignment file.
+
+        Parameters:
+        - alignment_file: Path to the alignment file (e.g., in FASTA format).
+        - consensus_threshold: Threshold for determining the consensus (default is 0.7).
+
+        Returns:
+        - A consensus sequence as a string.
+        """
+        # Load the alignment from the file
+        alignment = AlignIO.read(alignment_file, "fasta")
+
+        # Create a summary object from the alignment
+        summary_align = AlignInfo.SummaryInfo(alignment)
+
+        # Generate the consensus sequence based on the given threshold
+        consensus = summary_align.dumb_consensus(threshold=consensus_threshold, ambiguous="N")
+
+        return str(consensus)
+
+    def find_conserved_regions_consensus(self, alignment_file, threshold=0.7, min_length=5):
+        """
+        Identifies conserved regions in a set of sequences based on a consensus sequence from an existing alignment,
+        including only those regions that meet a specified minimum length.
+
+        Parameters:
+        - alignment_file: Path to the alignment file.
+        - threshold: Proportion of sequences that must contain a nucleotide at a position for it to be considered conserved.
+        - min_length: Minimum length of conserved regions to be included in the result.
+
+        Returns:
+        - A tuple of two lists:
+            1. The first list is a list of lists, where each inner list represents the positions of one conserved region.
+            2. The second list is a list of lists of dominant letters for each conserved region.
+        """
+        # Read the alignment
+        alignment = AlignIO.read(alignment_file, "fasta")  # Adjust the format if necessary
+
+        # Generate a consensus sequence
+        summary_align = AlignInfo.SummaryInfo(alignment)
+        consensus_info = summary_align.summary()
+
+        conserved_regions_positions = []
+        conserved_regions_letters = []
+        current_region_positions = []
+        current_region_letters = []
+
+        for i, base_dict in enumerate(consensus_info.items(), start=1):  # Positions are 1-based
+            total_bases = sum(base_dict[1].values())
+            dominant_bases = {base: count for base, count in base_dict[1].items() if count / total_bases >= threshold}
+
+            if dominant_bases:
+                current_region_positions.append(i)
+                current_region_letters.append(list(dominant_bases.keys()))
+            else:
+                if current_region_positions and len(current_region_positions) >= min_length:
+                    conserved_regions_positions.append(current_region_positions)
+                    conserved_regions_letters.append(current_region_letters)
+                    current_region_positions = []
+                    current_region_letters = []
+
+        # Check if there's an unclosed region at the end that meets the minimum length requirement
+        if current_region_positions and len(current_region_positions) >= min_length:
+            conserved_regions_positions.append(current_region_positions)
+            conserved_regions_letters.append(current_region_letters)
+
+        return conserved_regions_positions, conserved_regions_letters
+
+    def shannon_entropy(self, letter_count_dict, base=2):
+        """
+        Calculate the Shannon Entropy based on a dictionary of the letters occurring at a given position and the amount of occurrences
+        """
+
+        total_sum = sum(letter_count_dict.values())
+        for key in letter_count_dict:
+            letter_count_dict[key] = (letter_count_dict[key] / total_sum) * math.log(letter_count_dict[key] / total_sum,
+                                                                                     base)
+        entropy = - sum(letter_count_dict.values())
+
+        return entropy
+
+    def find_conserved_regions_shannon_entropy(self, sequence_df, entropy_thr=0.2, length_thr=3):
+        """
+        Find conserved regions with set minimal length based on a entropy threshold
+        """
+        # find out how long the alignments are
+        valuesList = list(sequence_df["Seq"])
+        alignLength = len(valuesList[0])
+
+        # initiate lists
+        conserved_regions_positions = list()
+        conserved_regions_dominant = list()
+        current_conserved_region = list()
+        current_conserved_region_letters = list()
+        current_conserved_scores = list()
+        current_dominant_gap_count = 0
+
+        # calculate Shannon Entropy for all positions and track the conserved regions
+        i = 0
+        while i in range(0, alignLength):
+            # count the different letters at each position
+            letter_count_dict = {}
+            for sequence in valuesList:
+                letter_count_dict[sequence[i]] = letter_count_dict.get(sequence[i], 0) + 1
+            # calculate Shannon Entropy
+            entropy = shannon_entropy(letter_count_dict)
+
+            # identify the dominant letter(s)
+            max_value = max(letter_count_dict.values())
+            dominant_letters = [key for key, value in letter_count_dict.items() if value == max_value]
+
+            # if the calculated entropy is smaller than the threshold, initiate a new conserved region or append to the current one
+            if entropy <= entropy_thr:
+                current_conserved_region.append(i)
+                current_conserved_region_letters.append(dominant_letters)
+                current_conserved_scores.append(entropy)
+                if "-" in dominant_letters:
+                    current_dominant_gap_count = current_dominant_gap_count + 1
+            # if the calculated entropy is bigger than the threshold, but we currently are in a conserved region, calculate the new average Shannon's Entropy
+            elif len(current_conserved_region) > 0:
+                current_conserved_scores.append(entropy)
+                average = sum(current_conserved_scores) / len(current_conserved_scores)
+                # continue the conserved region if it is smaller than the threshold
+                if average <= entropy_thr:
+                    current_conserved_region.append(i)
+                    current_conserved_region_letters.append(dominant_letters)
+                    if "-" in dominant_letters:
+                        current_dominant_gap_count = current_dominant_gap_count + 1
+                # otherwise end the conserved region and add it to the list of conserved regions if it meets the length threshold
+                else:
+                    if len(current_conserved_region) - current_dominant_gap_count >= length_thr:
+                        conserved_regions_positions.append(current_conserved_region)
+                        conserved_regions_dominant.append(current_conserved_region_letters)
+                    current_conserved_region = list()
+                    current_conserved_region_letters = list()
+                    current_dominant_gap_count = 0
+
+            i = i + 1
+
+        # add the last current region to the list of conserved regions if it meets the length threshold
+        if len(current_conserved_region) > 0:
+            conserved_regions_positions.append(current_conserved_region)
+            conserved_regions_dominant.append(current_conserved_region_letters)
+
+        return conserved_regions_positions, conserved_regions_dominant
+
+    def extract_consensus_sequence_and_conserved_regions(self, folder_path):
+        results = {}
+        for file_name in os.listdir(folder_path):
+            if file_name.endswith(".aln"):
+                species_name = "_".join(file_name.split("_")[:-1])
+                alignment_file = os.path.join(folder_path, file_name)
+                consensus_sequence = self.get_consensus_sequence_from_alignment(alignment_file)
+
+                alignment_df = alignment_to_dataframe(alignment_file)
+
+                conserved_regions, dominant_letters = self.find_conserved_regions_shannon_entropy(alignment_df)
+                results[species_name] = (consensus_sequence, conserved_regions, dominant_letters)
+
+        return results
+
+    def extract_conserved_region_sequences(self, species_data, species_name):
+        """
+        Creates a dictionary with individual conserved regions as keys (including the species name and a two-digit index)
+        and the actual sequences of these regions as values for a selected species. The keys are formatted as
+        "speciesName_XX_start-end" for each conserved region, where XX is the two-digit index of the region.
+
+        Parameters:
+        - species_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - species_name: The name of the species to process.
+
+        Returns:
+        - A dictionary with conserved regions (identified by species name, index, start and end positions)
+          as keys and sequences for these regions as values.
+        """
+        conserved_regions_dict = {}
+        if species_name in species_data:
+            consensus_sequence, conserved_regions_positions, _ = species_data[species_name]
+
+            for idx, region_positions in enumerate(conserved_regions_positions, start=1):
+                start, end = region_positions[0], region_positions[-1]  # Extract start and end from the positions list
+                # Extract the sequence part corresponding to the current conserved region using slicing
+                region_sequence = consensus_sequence[start - 1:end]  # Adjust if your positions are 1-based
+                # Create a unique key for each region including the species name, a two-digit index, and its start and end positions
+                region_key = f"{species_name}_{idx:02d}_{start}-{end}"
+                conserved_regions_dict[region_key] = region_sequence
+        else:
+            print(f"Species '{species_name}' not found in the data.")
+
+        return conserved_regions_dict
+
+    def conserved_regions_to_dataframe(self, conserved_regions_info):
+        """
+        Processes information about conserved regions and stores it in the candidate_species_markers attribute as a DataFrame.
+
+        Parameters:
+        - conserved_regions_info: A dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        """
+        # Temporary list to store data before converting to DataFrame
+        temp_data = []
+
+        for species, (consensus_sequence, regions_positions, _) in conserved_regions_info.items():
+            for idx, region_positions in enumerate(regions_positions, start=1):
+                start, end = region_positions[0], region_positions[-1]
+                # Append the data to the temp_data list
+                temp_data.append(
+                    {'species': species, 'index': idx, 'consensusSequence': consensus_sequence, 'start': start, 'end': end})
+
+        # Convert the temporary list of data into a DataFrame
+        new_data = pd.DataFrame(temp_data)
+
+        # Store this new DataFrame in the candidate_species_markers attribute
+        self.candidate_species_markers = pd.concat([self.candidate_species_markers, new_data], ignore_index=True)
+
+    def extract_sequences_and_run_minimap2(self, species_conservation_data, reference_db):
+        """
+        Loops through species and their conserved regions, extracts corresponding parts of the consensus sequence,
+        and runs minimap2 against a reference database for these sequences.
+
+        Parameters:
+        - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - reference_db: Path to the reference database used by minimap2.
+        """
+        for species, (consensus_seq, conserved_regions, _) in species_conservation_data.items():
+            for idx, region_positions in enumerate(conserved_regions, start=1):
+                start_end_tuples = [(region[0], region[-1]) for region in region_positions if region]
+                for start, end in start_end_tuples:
+                    # Extract the sequence part corresponding to the current conserved region
+                    region_seq = consensus_seq[start:end + 1]
+
+                    # Create a temporary file to store the region sequence for minimap2 input
+                    temp_seq_file = f"temp_{species}_{start}_{end}.fasta"
+                    with open(temp_seq_file, "w") as f:
+                        f.write(f">{species}_{start}_{end}\n{region_seq}\n")
+
+                    # Define the output folder dynamically based on species and region
+                    output_folder_specific = os.path.join("marker_loci/alignment/minimap2", species, f"_{idx:02d}_{start}_{end}_alignment.paf")
+                    os.makedirs(output_folder_specific, exist_ok=True)
+
+                    # Run minimap2 for the extracted sequence part against the reference database
+                    self.run_minimap2(self.alignment_to_dataframe(temp_seq_file), reference_db, output_folder=output_folder_specific)
+
+                    # Build the minimap2 command
+                    minimap2_cmd = ["minimap2", reference_db, temp_fasta_filename, "-o", output_file]
+
+                    # Run minimap2
+                    subprocess.run(minimap2_cmd)
+
+                    # Remove the temporary sequence file after minimap2 run
+                    os.remove(temp_seq_file)
+
+    def calculate_identity_and_filter(self, paf_folder_path, identity_threshold=98):
+        """
+        Processes all PAF files in a specified folder, calculating the identity of alignments,
+        filtering based on a threshold, and calculating the proportion of alignments to the correct species.
+
+        Parameters:
+        - paf_folder_path: Path to the folder containing PAF files.
+        - identity_threshold: Minimum identity percentage to filter alignments.
+
+        Returns:
+        - A dictionary where keys are sequence names (from filenames) and values are the proportion
+          of alignments to the correct species.
+        """
+        results = {}
+
+        # Loop through all PAF files in the folder
+        for paf_file in glob.glob(os.path.join(paf_folder_path, '*.paf')):
+            sequence_name = os.path.basename(paf_file).replace("_alignment.paf", "")
+            species_name = sequence_name.replace("_", " ")
+
+            total_alignments = 0
+            correct_species_alignments = 0
+
+            with open(paf_file, 'r') as file:
+                for line in file:
+                    parts = line.strip().split('\t')
+                    if len(parts) < 12:
+                        continue  # Ensure there are enough fields for analysis
+
+                    # Extract relevant information from the PAF line
+                    query_length = int(parts[1])
+                    num_matches = int(parts[9])
+                    block_length = int(parts[10])
+
+                    # Calculate identity as the percentage of matches over the alignment block length
+                    identity = (num_matches / block_length) * 100
+
+                    # Filter alignments based on identity threshold
+                    if identity >= identity_threshold:
+                        total_alignments += 1
+                        ref_species_name = parts[5].split('_')[1]
+
+                        if ref_species_name == species_name:
+                            correct_species_alignments += 1
+
+            # Calculate and store the proportion of correct species alignments
+            if total_alignments > 0:
+                results[sequence_name] = correct_species_alignments / total_alignments
+            else:
+                results[sequence_name] = 0  # No alignments met the identity threshold
+
+        return results
+
+    def filter_candidate_species_markers(self, target_folder="marker_loci/alignment/minimap2", threshold=0.95):
+        """
+        Modified to extract region index from sequence names, convert to number, and filter
+        candidate_species_markers DataFrame based on species and region index.
+
+        Parameters:
+        - target_folder: Path to the target folder containing subdirectories for each species.
+        - threshold: Proportion threshold for selecting sequences.
+        """
+        filtered_sequences = pd.DataFrame()
+
+        # Loop through each subdirectory in the target folder
+        for species in os.listdir(target_folder):
+            species_dir = os.path.join(target_folder, species)
+            if os.path.isdir(species_dir):
+                species_results = self.calculate_identity_and_filter(species_dir)
+
+                # Filter sequences based on the threshold and extract region index
+                for seq_name, prop in species_results.items():
+                    if prop >= threshold:
+                        # Extracting the region index from the sequence name
+                        _, region_index_str, _ = seq_name.split('_')[-3:]
+                        region_index = int(region_index_str)  # Convert index to integer
+
+                        # Select matching rows from candidate_species_markers DataFrame
+                        matching_rows = self.candidate_species_markers[
+                            (self.candidate_species_markers['species'] == species) &
+                            (self.candidate_species_markers['index'] == region_index)
+                        ]
+
+                        # Append these rows to the filtered_sequences DataFrame
+                        filtered_sequences = pd.concat([filtered_sequences, matching_rows], ignore_index=True)
+
+        return filtered_sequences
+
+    def evaluate_species_identification(self, results, threshold=0.95):
+        """
+        Evaluates the identification reliability of species based on their alignment proportions.
+
+        Parameters:
+        - results: A dictionary where keys are species names and values are proportions of correctly identified alignments.
+        - threshold: The proportion threshold above which a species is considered reliably identified.
+
+        Returns:
+        - The number of species reliably identified based on the given threshold.
+        """
+        reliable_identifications = {species: proportion >= threshold for species, proportion in results.items()}
+        # Calculate the proportion of species identified reliably
+        proportion_reliable_species = sum(reliable_identifications.values()) / len(results) if results else 0
+        return proportion_reliable_species
+
+    def cross_species_markers_test_minimap2(self, species_markers, reference_db_base_path, output_base_path):
+        """
+        Executes minimap2 for marker regions of each species against all other species.
+
+        Parameters:
+        - species_markers: DataFrame with columns 'species', 'index', 'consensusSequence', 'start', 'end'.
+        - reference_db_base_path: Base path where reference databases for each species are stored.
+        - output_base_path: Base path where minimap2 output files will be stored.
+        """
+        species_list = species_markers['species'].unique()
+
+        for target_species in species_list:
+            markers = species_markers[species_markers['species'] == target_species]
+
+            for _, marker in markers.iterrows():
+                # Prepare the query sequence
+                query_sequence = marker['consensusSequence'][marker['start'] - 1:marker['end']]
+                region_index = marker['index']
+
+                with NamedTemporaryFile(mode='w', delete=False) as temp_file:
+                    temp_file.write(f">{target_species}_{region_index}\n{query_sequence}\n")
+                    temp_file_path = temp_file.name
+
+                for reference_species in species_list:
+                    if reference_species != target_species:
+                        # Define the reference database path for the current reference_species
+                        reference_db = os.path.join(reference_db_base_path, f"{reference_species}.db")
+
+                        # Define the output folder path for the results
+                        output_folder = os.path.join(output_base_path, target_species, f"against_{reference_species}")
+                        os.makedirs(output_folder, exist_ok=True)
+
+                        # Define the output file path
+                        output_file = os.path.join(output_folder, f"{target_species}_{str(region_index).zfill(2)}_vs_{reference_species}.paf")
+
+                        # Construct the minimap2 command
+                        minimap2_cmd = [
+                            'minimap2',
+                            # '-a',
+                            reference_db,
+                            temp_file_path,
+                            '-o',
+                            output_file
+                        ]
+
+                        # Execute minimap2
+                        try:
+                            subprocess.run(minimap2_cmd, check=True)
+                            print(f"minimap2 alignment completed: {output_file}")
+                        except subprocess.CalledProcessError as e:
+                            print(f"Error running minimap2: {e}")
+
+                # Cleanup the temporary file
+                os.remove(temp_file_path)
+
+    def create_coverage_matrix(self, alignment_threshold=0.5):
+        """
+        Creates a coverage matrix indicating which marker regions can identify which species,
+        based on the analysis of minimap2 results.
+
+        Parameters:
+        - alignment_threshold: Threshold for the proportion of correct alignments above which
+          a marker is considered reliable for identifying a species.
+        """
+        # Prepare the coverage matrix structure
+        species_list = self.species_markers['species'].unique()
+        self.coverage_matrix = pd.DataFrame(columns=['Marker', *species_list])
+
+        # Loop through each species and its markers
+        for _, row in self.species_markers.iterrows():
+            species = row['species']
+            index = row['index']
+            marker_id = f"{species}_{str(index).zfill(2)}"  # Construct marker ID as used in PAF filenames
+
+            # Initialize a dictionary to hold the coverage data for this marker
+            coverage_data = {'Marker': marker_id}
+
+            # Loop through all species to compare against this marker
+            for target_species in species_list:
+                if target_species == species:
+                    coverage_data[target_species] = None  # Skip self-comparison
+                    continue
+
+                # Construct the path to the PAF files for this marker against the target_species
+                paf_folder_path = os.path.join(self.output_base_path, species, f"against_{target_species}")
+
+                # Use calculate_identity_and_filter to process the PAF files and get results
+                results = self.calculate_identity_and_filter(paf_folder_path)
+
+                # Determine if the marker reliably identifies the target_species based on alignment_threshold
+                is_reliable = 1 if results.get(marker_id, 0) >= alignment_threshold else 0
+                coverage_data[target_species] = is_reliable
+
+            # Append the coverage data for this marker to the coverage matrix
+            self.coverage_matrix = self.coverage_matrix.append(coverage_data, ignore_index=True)
+
+    def save_coverage_matrix_to_csv(self, filename):
+        """
+        Saves the coverage matrix DataFrame to a CSV file.
+
+        Parameters:
+        - filename: The path and name of the file where the coverage matrix will be saved.
+        """
+        if not self.coverage_matrix.empty:
+            self.coverage_matrix.to_csv(filename, index=False)
+            print(f"Coverage matrix saved to {filename}.")
+        else:
+            print("Coverage matrix is empty. No file was created.")
+
+    def select_optimal_markers(self):
+        """
+        Selects markers that reliably identify the most species, then markers that cover most of the
+        remaining species, and so forth, until markers for all species are selected. Species that are determined
+        to be uncovered by any available markers are recorded.
+        """
+        # Convert coverage entries to numeric values for easier processing
+        coverage_df = self.coverage_matrix.set_index('Marker').apply(pd.to_numeric, errors='coerce')
+        species_list = coverage_df.columns
+
+        # Initialize a set to keep track of covered species
+        covered_species = set()
+
+        while covered_species != set(species_list):
+            # Sum the coverage for each marker across all species
+            marker_coverage = coverage_df.sum(axis=1)
+
+            # Select the marker with the maximum coverage of uncovered species
+            best_marker = marker_coverage.idxmax()
+            best_coverage = marker_coverage.max()
+
+            # If no marker adds coverage, break the loop
+            if best_coverage == 0:
+                break
+
+            # Update the list of selected markers
+            self.selected_markers.append(best_marker)
+
+            # Update the set of covered species
+            newly_covered_species = coverage_df.loc[best_marker][coverage_df.loc[best_marker] == 1].index
+            covered_species.update(newly_covered_species)
+
+            # Remove the selected marker to not consider it in the next iteration
+            coverage_df.drop(index=best_marker, inplace=True)
+
+        # Identify species without markers
+        uncovered_species = set(species_list) - covered_species
+        for species in uncovered_species:
+            self.species_without_markers[species] = "No available markers"
+
+    def save_optimal_markers_to_csv(self, markers_output_file, uncovered_species_output_file):
+        """
+        Saves the list of selected markers and the list of species not covered by any markers to separate CSV files.
+
+        Parameters:
+        - markers_output_file: Path to the output CSV file for selected markers.
+        - uncovered_species_output_file: Path to the output CSV file for species not covered by any markers.
+        """
+        # Save selected markers
+        pd.DataFrame(self.selected_markers, columns=['Selected Markers']).to_csv(markers_output_file, index=False)
+
+        # Save species not covered by any markers
+        if self.species_without_markers:
+            uncovered_species_df = pd.DataFrame(list(self.species_without_markers.keys()),
+                                                columns=['Uncovered Species'])
+            uncovered_species_df.to_csv(uncovered_species_output_file, index=False)
+        else:
+            print("All species are covered by the selected markers.")
+
+    def identify_snps_and_indels(self, alignment_file, format='fasta'):
+        """
+        Identifies SNPs and indels in a multiple sequence alignment.
+
+        Parameters:
+        - alignment_file: Path to the alignment file.
+        - format: Format of the alignment file (default 'fasta').
+
+        Returns:
+        - A dictionary with 'snps' and 'indels' as keys and lists of positions as values.
+        """
+        alignment = AlignIO.read(alignment_file, format)
+        snps = []
+        indels = []
+
+        for i in range(alignment.get_alignment_length()):
+            column = alignment[:, i]
+            if '-' in column:
+                indels.append(i)
+            elif len(set(column)) > 1:
+                snps.append(i)
+
+        return {'snps': snps, 'indels': indels}
+
+    def identify_markers(self, ):
+        self.species_markers = filter_candidate_species_markers()
+        save_optimal_markers_to_csv()
+
+    def design_primers(self, input_file, output_file, primer_design_algorithm: PrimerDesignAlgorithm, primer_design_params, primer_summarizing_algorithm: PrimerSummarizerAlgorithm, primer_summarizing_params, specificity_check_algorithm: SpecificityCheckAlgorithm, primer_specificity_params, specificity_check_database):
+        pass
+
+class MarkerLociGroupDifferentiationStrategy(Strategy):
     @staticmethod
     def sequence_to_kmers(sequence, k):
         return [sequence[i:i + k] for i in range(len(sequence) - k + 1)]
@@ -535,7 +1548,7 @@ class MarkerLociIdentificationStrategy(Strategy):
             dataset = TensorDataset(features_padded, labels)
             return DataLoader(dataset, batch_size=batch_size, shuffle=True)
 
-         def _train(self):
+        def _train(self):
             num_epochs = self.config.get("num_epochs", 10)
 
             for epoch in range(num_epochs):
@@ -680,10 +1693,30 @@ class StrategyContext:
 
 
 if __name__ == "__main__":
-
     ray.init()
 
     parser = argparse.ArgumentParser(description="")
+
+    # Add arguments related to marker loci identification to the parser
+    parser.add_argument("-a", "--alignment-tool", choices=['clustalw', 'muscle', 'mafft', 'prank'],
+                        help="Alignment tool to use. Possible values: clustalw, muscle, mafft, prank.")
+
+    parser.add_argument("-r", "--reference-db", required=True,
+                        help="Path to the reference database for minimap2.")
+
+    parser.add_argument("-i", "--identity-threshold", type=int, choices=range(0, 101),
+                        help="Identity threshold for minimap2 (0-100).")
+
+    parser.add_argument("-p", "--proportion-threshold", type=int, choices=range(0, 101),
+                        help="Threshold for proportion of correctly identified sequences (0-100).")
+
+    parser.add_argument("-l", "--min-length", type=int,
+                        help="Minimum length of conserved regions.")
+
+    parser.add_argument("-g", "--algorithm", choices=['consensus_sequence', 'shannon_entropy', 'quasi_alignment'],
+                        help="Algorithm for finding conserved regions. Possible values: consensus_sequence, shannon_entropy, quasi_alignment.")
+
+    # Add arguments related to primer design to the parser
     parser.add_argument('-i', '--input_file', required=True, help='The input file to process.')
     parser.add_argument('-o', '--output_file', required=True, default='output.txt', help='The output file to write to.')
     parser.add_argument('-s', '--strategy', required=True, default='amplicon', choices=['amplicon', 'marker'], help='Choose a general strategy - primer design only for the WGS dataset (amplicon) or identification of marker loci in the WGS dataset followed by the primer design for the identified marker loci (marker).')
