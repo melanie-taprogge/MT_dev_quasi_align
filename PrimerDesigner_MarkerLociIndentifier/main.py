@@ -493,6 +493,13 @@ class MarkerLociIdentificationStrategy(Strategy):
         # Initialize a dictionary to indicate species without markers
         self.species_without_markers = {}
 
+        self.db_params = {
+            "dbname": "genomics_db",
+            "user": user,
+            "password": password,
+            "host": "localhost"
+        }
+
     def run_cactus(self, config_path, seq_file_paths, output_dir):
         """
         Runs the Cactus program with the given configuration, sequence files, and output directory.
@@ -632,6 +639,44 @@ class MarkerLociIdentificationStrategy(Strategy):
         # Run Panaroo
         subprocess.run(panaroo_cmd, check=True)
 
+    def save_annotated_genes_from_panaroo(self, panaroo_output_dir):
+        """
+        Saves annotated genes from Panaroo's output into the PostgreSQL database.
+
+        Parameters:
+        - panaroo_output_dir: Directory containing Panaroo's GFF output files.
+        """
+        # Connect to the database
+        conn = psycopg2.connect(**self.db_params)
+        cur = conn.cursor()
+
+        # Path to the GFF file
+        gff_file_path = os.path.join(panaroo_output_dir,
+                                     "gene_data.csv")  # Panaroo outputs a gene_data.csv that contains the consolidated annotations
+
+        # Parse the GFF file
+        with open(gff_file_path, 'r') as file:
+            for line in file:
+                if line.startswith("gene_id"):  # Skip header
+                    continue
+                parts = line.strip().split(',')
+                gene_name = parts[0]
+                species = parts[2]
+                sequence = parts[3]
+                annotation = parts[4]
+                category = "not specified"
+
+                # Insert into the database
+                insert_command = sql.SQL("""INSERT INTO annotated_genes 
+                                            (species, gene_name, sequence, annotation, category) 
+                                            VALUES (%s, %s, %s, %s, %s);""")
+                cur.execute(insert_command, (species, gene_name, sequence, annotation, category))
+
+        # Commit changes and close the connection
+        conn.commit()
+        cur.close()
+        conn.close()
+
     def run_pgap(self, genome_paths, output_dir, pgap_version='2021-07-01.build5508', container_runtime='docker'):
         """
         Annotates genomes using the NCBI Prokaryotic Genome Annotation Pipeline (PGAP).
@@ -696,36 +741,38 @@ class MarkerLociIdentificationStrategy(Strategy):
         with open(yaml_input_path, 'w') as file:
             file.write(yaml_content)
 
-    def check_ncbi_annotations(self, species_name, email):
-        Entrez.email = email
-        search_handle = Entrez.esearch(db="genome", term=species_name, retmax=10)
-        search_results = Entrez.read(search_handle)
-        search_handle.close()
-
-        return bool(search_results["IdList"])
-
-    def download_genome_annotation(self, accession, email, output_file):
+    def save_annotated_genes_from_pgap(self, pgap_output_file):
         """
-        Downloads genome annotation for a given accession number and saves it to a file.
+        Saves annotated genes from PGAP's GenBank output into the PostgreSQL database.
 
         Parameters:
-        - accession: The accession number of the genome.
-        - email: Your email address (used when accessing NCBI's E-utilities).
-        - output_file: The file path where the genome annotation should be saved.
+        - pgap_output_file: Path to PGAP's GenBank output file containing annotated genes.
         """
-        Entrez.email = email
-        try:
-            # Fetch the genome annotation from NCBI
-            handle = Entrez.efetch(db="nucleotide", id=accession, rettype="gbwithparts", retmode="text")
-            annotation_data = handle.read()
-            handle.close()
+        # Connect to the database
+        conn = psycopg2.connect(**self.db_params)
+        cur = conn.cursor()
 
-            # Save the annotation data to a file
-            with open(output_file, 'w') as file:
-                file.write(annotation_data)
-            print(f"Genome annotation for {accession} saved to {output_file}")
-        except Exception as e:
-            print(f"An error occurred while downloading the annotation: {e}")
+        # Parse the GenBank file
+        with open(pgap_output_file) as file:
+            for record in SeqIO.parse(file, "genbank"):
+                species = record.annotations.get("organism", "Unknown species")
+                for feature in record.features:
+                    if feature.type == "gene" or feature.type == "CDS":
+                        gene_name = feature.qualifiers.get("locus_tag", ["Unknown"])[0]
+                        sequence = str(feature.extract(record.seq))
+                        annotation = feature.qualifiers.get("product", [""])[0]
+                        category = "not specified"
+
+                        # Insert into the database
+                        insert_command = sql.SQL("""INSERT INTO annotated_genes 
+                                                    (species, gene_name, sequence, annotation, category) 
+                                                    VALUES (%s, %s, %s, %s, %s);""")
+                        cur.execute(insert_command, (species, gene_name, sequence, annotation, category))
+
+        # Commit changes and close the connection
+        conn.commit()
+        cur.close()
+        conn.close()
 
     def extract_species_from_filename(self, genome_path):
         """
@@ -1704,10 +1751,10 @@ if __name__ == "__main__":
     parser.add_argument("-r", "--reference-db", required=True,
                         help="Path to the reference database for minimap2.")
 
-    parser.add_argument("-i", "--identity-threshold", type=int, choices=range(0, 101),
+    parser.add_argument("-I", "--identity-threshold", type=int, choices=range(0, 101),
                         help="Identity threshold for minimap2 (0-100).")
 
-    parser.add_argument("-p", "--proportion-threshold", type=int, choices=range(0, 101),
+    parser.add_argument("-P", "--proportion-threshold", type=int, choices=range(0, 101),
                         help="Threshold for proportion of correctly identified sequences (0-100).")
 
     parser.add_argument("-l", "--min-length", type=int,
