@@ -1059,6 +1059,333 @@ class MarkerLociIdentificationStrategy(Strategy):
 
         return conserved_regions_positions, conserved_regions_dominant
 
+    def manhattan_distance(vector1,vector2):
+        """
+        Calculate the manhattan distance between two vectors
+        """
+        if len(vector1)==len(vector2):
+            distance=0
+            for i in range(0,len(vector1)):
+                distance = distance + (abs(vector1[i]-vector2[i]))
+                
+        else:
+            print(f"error: vectors do not have the same length")
+        return distance
+    
+    def calculate_centroid_mean(vectors):
+        """
+        Calculate the centroid as the mean of all vectors in a cluster
+        """
+        mean_vector = [sum(values) / len(vectors) for values in zip(*vectors)]
+        return mean_vector
+
+    def find_clusters(segment_df,metric,threshhold):
+        """
+        Cluster the segments based on their metric distance
+        """
+        only_add_to_best_match = False
+        # todo: maybe different way of determining which cluster to add this too if two clusters are equally good.
+
+        # The cluster centers will hold an average vector for each cluster and be used to determine the distance of each segment to each cluster. 
+        clusters = []
+        cluster_centers = []
+        
+        for genome_id in segment_df['genome_id'].unique():
+
+            # For each of the different genome IDs, look at each vector representing a sequence segment summary vector and either create a new cluster for it
+            # or or put it inot one of the existing clusters
+            for rowWithId in segment_df[segment_df['genome_id'] == genome_id].index:
+                vector = segment_df.iloc[rowWithId]['vector']
+
+                if len(cluster_centers) == 0:
+                    # Create a new cluster for the first segment
+                    clusters.append([vector])
+                    # A cluster with only one sequence has that sequence as its center
+                    cluster_centers.append(vector)
+                    # The information which cluster we added the segment to is added to the df
+                    segment_df.at[rowWithId, 'cluster'] = [0]
+                    
+                else:
+                    if only_add_to_best_match:
+                        # Calculate the metric distances of the segment to each center of a cluster
+                        metric_distances = []
+                        for center in cluster_centers:
+                            if metric == "manhattan":
+                                metric_distances.append(manhattan_distance(center,vector))
+                            else:
+                                raise Exception(f"unknown metric {metric} selected for conserved region identification based on quasi alignments")
+
+                        if min(metric_distances) <= threshhold:
+                            min_dist_cluster_index = metric_distances.index(min(metric_distances))
+                            clusters[min_dist_cluster_index].append(vector)
+                            cluster_centers[min_dist_cluster_index] = calculate_centroid_mean(clusters[min_dist_cluster_index])
+                            segment_df.at[rowWithId, 'cluster'] = [min_dist_cluster_index]
+
+                        else:
+                            clusters.append([vector])
+                            cluster_centers.append(vector)
+                            segment_df.at[rowWithId, 'cluster'] = [len(clusters)]
+
+                    else:
+                        #todo: try to instead add to any cluster where the distance is smaller than the threshold and see if it is better
+                        clusters_under_thr = []
+
+                        for center in cluster_centers:
+                            if metric == "manhattan":
+                                dist = manhattan_distance(center,vector)
+                            else:
+                                raise Exception(f"unknown metric {metric} selected for conserved region identification based on quasi alignments")
+                            if dist <= threshhold:
+                                cluster_index = cluster_centers.index(center)
+                                clusters[cluster_index].append(vector)
+                                cluster_centers[cluster_index] = calculate_centroid_mean(clusters[cluster_index])
+                                clusters_under_thr.append(cluster_index)
+
+                        if len(clusters_under_thr) > 0:
+                            segment_df.at[rowWithId, 'cluster'] = clusters_under_thr
+                        else:
+                            clusters.append([vector])
+                            cluster_centers.append(vector)
+                            segment_df.at[rowWithId, 'cluster'] = [len(clusters)]
+
+        return segment_df
+
+    def trim_sequence(source_df,seq_id,beginning,end,continuation_len_thr,segment_size):
+        """
+        based on beginning and end points, get a new sequence fragment and add a few bases at the beginning and end (determined by continuation_len_thr) if in bound of the sequence
+        """
+        seq_beginning = beginning - round(0.5*continuation_len_thr*segment_size) if (beginning - round(0.5*continuation_len_thr*segment_size) > 0) else 0
+        seq_end = end + round(0.5*continuation_len_thr*segment_size) if (end + round(0.5*continuation_len_thr*segment_size) < len(source_df.loc[source_df["genome_id"]==seq_id]["sequence"].iloc[0])) else len(source_df.loc[source_df["genome_id"]==seq_id]["sequence"].iloc[0])
+        sequence = source_df.loc[source_df["genome_id"]==seq_id]["sequence"].iloc[0][seq_beginning:seq_end]
+
+        return sequence
+                        
+    def find_candidate_regions(segment_df, source_df, segment_size, conservation_thr,continuation_len_thr):
+        """
+        Identify the candidates for conserved regions based on the clusters.
+        In this step, several segments of the same sequence within one cluster are merged if they overlap or are close together.
+        """
+        # Extract the numbers of the clusters as well as the total number of different sequences
+        cluster_numbers = list(set([number for list in segment_df['cluster'] for number in list]))
+        number_of_sequences = len(segment_df['genome_id'].unique())
+
+        # Initiate an empty data frame to write the information to
+        columns = ['cluster','genome_id', 'sequence', 'beginning', 'end']
+        candidate_conserved_region_df = pd.DataFrame(columns=columns)
+
+        for cluster_n in cluster_numbers:
+            # For each cluster, we consider all the segments that are in the cluster
+            current_cluster = segment_df[segment_df["cluster"].apply(lambda list: cluster_n in list)]
+            # We calculate a consensus score that tells us how big a fraction of the different sequences has at least one segment in the cluster
+            cluster_origins = current_cluster['genome_id'].unique()
+            consensus_score = round(len(cluster_origins)/number_of_sequences,2)
+
+            if consensus_score >= conservation_thr:
+                # If the consensus sore is smaller than the threshold, we add the cluster as a candidate conserved region
+                for seq_id in cluster_origins:
+                    beginning = current_cluster[current_cluster["genome_id"]==seq_id]['beginning'].values
+                    end = current_cluster[current_cluster["genome_id"]==seq_id]['end'].values
+
+                    if(isinstance(beginning,np.ndarray)):
+                        # If more than just one segment per sequence was added, we want to either consider them as one large segment 
+                        # if they are overlapping or close we just adjust beginning and end, otherwise we ?
+                        beginning_sorted = sorted(beginning)
+                        end_sorted = sorted(end)
+
+                        new_beginning = beginning[0] 
+                        new_end = end[0]
+                        for i in range(1,len(beginning_sorted)):
+                            if (beginning_sorted[i]-beginning_sorted[i-1]-segment_size > continuation_len_thr*segment_size):
+                                # todo: for now i just added both of them but i might want to come up with a better method... one possibility: in this case we want to align only one of the segments, we take the one that is closer to the center
+                                
+                                # the two segments are too far apart to be united so we add the first one to the df and continue looking at the next segment
+                                sequence = trim_sequence(source_df,seq_id,new_beginning,new_end,continuation_len_thr,segment_size)
+                                new_row = pd.DataFrame({'cluster' : [cluster_n],'genome_id' : [seq_id],'sequence' : [sequence], 'beginning': [new_beginning], 'end': [new_end]})
+                                candidate_conserved_region_df = pd.concat([candidate_conserved_region_df, new_row], ignore_index=True)
+
+                                # and set the new beginning and end to the new segment
+                                new_beginning = beginning[i] 
+                                new_end = end[i]
+                            else:
+                                # we want to unite the segments, so we overwrite the "new end" and continue looking at the next segment
+                                new_end = end_sorted[i]
+                        # after looking at each segment, we add the last one to our df
+                        sequence = trim_sequence(source_df,seq_id,new_beginning,new_end,continuation_len_thr,segment_size)
+                        new_row = pd.DataFrame({'cluster' : [cluster_n],'genome_id' : [seq_id],'sequence' : [sequence], 'beginning': [new_beginning], 'end': [new_end]})
+                        candidate_conserved_region_df = pd.concat([candidate_conserved_region_df, new_row], ignore_index=True)
+                    
+                    else:
+                        # In cases where we only have one segment for a sequence, we sinply add the segment to the df:
+                        # We let the sequence be a bit longer than the candidate region so we can find the actual beginning of the conserved region in the alignment
+                        sequence = trim_sequence(source_df,seq_id,beginning,end,continuation_len_thr,segment_size)
+                        new_row = pd.DataFrame({'cluster' : [cluster_n],'genome_id' : [seq_id],'sequence' : [sequence], 'beginning': [beginning], 'end': [end]})
+                        candidate_conserved_region_df = pd.concat([candidate_conserved_region_df, new_row], ignore_index=True)
+            
+        return candidate_conserved_region_df
+
+    def find_overlapping_conserved_regions(candidate_conserved_region_df: pd.DataFrame, source_df, clusters_to_consider: list[int],clusters_in_final_df: list[int],continuation_len_thr,conservation_thr,number_of_sequences,segment_size):
+        """
+        Check if the candidate regions overlap or are very close to each other in any of the sequences and if so, combine them
+        """
+        for cluster_num in clusters_to_consider:
+
+            cluster_of_interest = candidate_conserved_region_df.loc[candidate_conserved_region_df["cluster"]==cluster_num]
+
+            edited = False
+
+            # For now we only consider clusters that have only one segment per sequence, todo: is this wise?
+            if len(set(cluster_of_interest["genome_id"]))==len(cluster_of_interest["genome_id"]):
+
+                # We compare the cluster to each other cluster we still need to consider
+                for cluster_to_compare_to in clusters_to_consider:
+                    if (cluster_num != cluster_to_compare_to):
+                        all_seq_distances:list = []
+                        sequences_in_cluster_to_compare_to = candidate_conserved_region_df.loc[candidate_conserved_region_df["cluster"] == cluster_to_compare_to]["genome_id"]
+                        # For now we only consider clusters that have only one segment per sequence, todo: is this wise?
+                        if len(set(sequences_in_cluster_to_compare_to))==len(sequences_in_cluster_to_compare_to):
+                            sequences_in_both_sets = set(cluster_of_interest["genome_id"]).intersection(set(sequences_in_cluster_to_compare_to))
+                            # if a sufficient number of sequences in in both clusters, we check if the sequences overlap or are close to each other
+                            if (len(sequences_in_both_sets) >= conservation_thr*number_of_sequences):
+                                for seq_id in sequences_in_both_sets:
+                                    beginning1 = candidate_conserved_region_df.loc[(candidate_conserved_region_df["cluster"] == cluster_to_compare_to)&(candidate_conserved_region_df["genome_id"] == seq_id)]["beginning"].values
+                                    beginning0 = cluster_of_interest.loc[cluster_of_interest["genome_id"] == seq_id]["beginning"].values
+                                    distance = min(abs(beginning1[0] - beginning0[0]),abs(beginning0[0] - beginning1[0]))
+                                    all_seq_distances.append(distance)
+                                averageDistance = sum(all_seq_distances)/len(all_seq_distances)
+                                if abs(averageDistance) <= continuation_len_thr:
+                                    # If this is the case, we merge the segments for each sequence and add them to the df
+                                    for seq_id in sequences_in_both_sets:
+                                        beginning0 = int(min(cluster_of_interest.loc[cluster_of_interest["genome_id"] == seq_id]["beginning"].values))
+                                        beginning1 = int(min(candidate_conserved_region_df.loc[(candidate_conserved_region_df["cluster"] == cluster_to_compare_to)&(candidate_conserved_region_df["genome_id"] == seq_id)]["beginning"].values))
+                                        new_beginning = int(min(beginning0,beginning1))
+                                        end0 = int(max(cluster_of_interest.loc[cluster_of_interest["genome_id"] == seq_id]["end"].values))
+                                        end1 = int(max(candidate_conserved_region_df.loc[(candidate_conserved_region_df["cluster"] == cluster_to_compare_to)&(candidate_conserved_region_df["genome_id"] == seq_id)]["end"].values))
+                                        new_end = int(max(end0,end1))
+                                        new_sequence = trim_sequence(source_df,seq_id,new_beginning,new_end,continuation_len_thr,segment_size)
+                                        new_cluster_name = max(candidate_conserved_region_df['cluster'])+1
+                                        new_row = pd.DataFrame({'cluster' : [new_cluster_name],'genome_id' : [seq_id],'sequence' : [new_sequence], 'beginning': [new_beginning], 'end': [new_end]})
+                                        candidate_conserved_region_df = pd.concat([candidate_conserved_region_df, new_row], ignore_index=True)
+                                    # remove the clusters from the list of clusters we still need to consider and add the new one instead 
+                                    clusters_to_consider=np.append(clusters_to_consider[(clusters_to_consider != cluster_num)&(clusters_to_consider != cluster_to_compare_to)],new_cluster_name)
+                                    edited = True
+                                    (candidate_conserved_region_df,clusters_in_final_df) = find_overlapping_conserved_regions(candidate_conserved_region_df,source_df,clusters_to_consider,clusters_in_final_df,continuation_len_thr,conservation_thr,number_of_sequences,segment_size)
+                                    break
+
+            if not edited :
+                clusters_to_consider=clusters_to_consider[clusters_to_consider != cluster_num]
+                clusters_in_final_df = np.append(clusters_in_final_df,cluster_num)
+            else: break
+
+        return (candidate_conserved_region_df,clusters_in_final_df)
+
+    def align_candidate_regions(candidate_conserved_region_df):
+        """
+        Align the sequences of the conserved region candidates
+        """
+        conserved_regions_positions = []
+        conserved_regions_dominant = []
+        cluster_nums = candidate_conserved_region_df['cluster'].unique()
+        for i in cluster_nums:
+            sequences_to_consider = candidate_conserved_region_df.loc[candidate_conserved_region_df["cluster"]==i]
+            sequence_tuples:list = []
+            for j in range(0,len(sequences_to_consider)):
+                (genome_id,sequence) = (sequences_to_consider.iloc[j]["genome_id"],sequences_to_consider.iloc[j]["sequence"])
+                sequence_tuples.append((genome_id,sequence))
+
+            with NamedTemporaryFile(delete=False) as temp_file:
+                for pair in sequence_tuples:
+                    # Write the sequences to a temporary FASTA file
+                    genome_in = pair[0]
+                    sequence = pair[1]
+                    temp_file.write(f">{genome_in} alignment_cluster_{i}_{genome_in}\n{sequence}\n".encode())
+                temp_file.flush()
+            alignment_path = align_sequences(temp_file.name)
+            df = f2p.read_multifasta(alignment_path)
+
+            conservedRegion = se.find_conserved_regions_shannon_entropy(df)
+            conserved_regions_positions = conserved_regions_positions + conservedRegion[0]
+            conserved_regions_dominant = conserved_regions_dominant + conservedRegion[1]
+        
+        return (conserved_regions_positions,conserved_regions_dominant)
+
+    def quasi_align(source_df,threshold,overlap,conservation_thr,additional_sequence_symbols:list[str]=[],metric:str="manhattan",length_thr=0.8,segment_size:int=100,continuation_len_thr:int=2):
+        """
+        Find conserved regions without aligning sequences based on a clustering method.
+        The sequences are divided into segments of a given length and the number of occurrences of the different possible base triplets is used to 
+        determine the distance between two segments based on a given Metric. Similar segments are then clustered to find candidates for conserved regions.
+
+        The parameters used here are:
+        - segment_size: The length of segments the sequences are divided into (default: 100)
+        - threshold: The maximum allowed metric distance that segments can have and still be clustered together
+        - overlap: When dividing the sequence into segments to compare triplet occurrences in, an overlap of segments can be allowed and is given as 1/n to indicate the fraction of segments at which the overlap should begin.
+        - conservation_thr: Sets the threshold for the fraction of all sequences that have to be in one cluster in order to consider the cluster as a potential conserved region
+        - length_thr: Determines the minimal length that a segment can have relative to the segment size (default: 0.8)
+        - continuation_len_thr: distance relative to segment size that two segments can have to be considered one continuous segment (default: 1)
+        """
+        # Todo: different distance for specific symbols? if e.g. n can be a or t then the distance of a n to these should be smaller than to g or c
+        # Todo: add words beginning from the reverse end if the segment is to short? to make sure every part of the sequence is actually covered
+        # Todo: find a better way to handle overlapping conserved region candidates. Right now we do not merge conserved region candidates if they have more than just one segment per sequence but in cases where we have very similar sequences this can lead to overlapping regions not being merged and we end up aligning more things than we would by just aligning the normal sequences
+        # Todo: come up with good way to determine default parameters e.g. based on a few tests with the summary vectors. (maybe by calculating distances within and between a few sequences)
+
+        # Generate all possible words of a given length (by default triplets) that we will later search for in the sequences. 
+        alphabet = ["A","T","G","C"] + additional_sequence_symbols
+        word_length = 3
+        possible_words = []
+        def generate(word:str):
+            if (len(word)-word_length) == 0:
+                possible_words.append(word)
+                return
+            else: 
+                for base in alphabet:
+                    generate(word + base)
+        generate("")
+
+        # Initiate a data frame to store the information on segments
+        columns = ['genome_id', 'beginning', 'end', 'sequence', 'vector',"cluster"]
+        segment_df = pd.DataFrame(columns=columns)
+
+        # Get the number of rows in the data frame containing the source sequences
+        num_samples = source_df.shape[0]
+
+        # Divide the sequences into segments, count triplet occurrences and store information in the new dataframe
+        for row in range(0,num_samples):
+
+            # Extract nformation from source df
+            sample = source_df.iloc[row]["sequence"]
+            genome_id = source_df.iloc[row]["genome_id"]
+
+            for i in range(0, len(sample), round(segment_size*overlap)):
+
+                # Extract the actual sequence for each segment
+                segment = sample[i:(i + segment_size)]
+
+                if len(segment) >=  length_thr*segment_size:
+
+                    # Construct a summary vector for triplet occurrences for each of the segments
+                    vector = []
+                    for word in possible_words:
+                        vector.append(segment.count(word))
+
+                    # Add the new information to the new df
+                    new_row = pd.DataFrame({'genome_id': genome_id, 'beginning' : i, 'end' : i + segment_size, 'sequence' : segment, 'vector' : [vector], "cluster" : [np.nan]})
+                    segment_df = pd.concat([segment_df, new_row], ignore_index=True)
+
+        # Find clusters and update the segment_df 
+        segment_df = find_clusters(segment_df,metric,threshold)
+
+        # Find candidate clusters for conserved regions
+        candidate_regions_df = find_candidate_regions(segment_df, source_df, segment_size, conservation_thr,continuation_len_thr)
+
+        # Merge overlapping regions:
+        (extended_candidate_regions_df,clusters_in_final_df) = find_overlapping_conserved_regions(candidate_regions_df, source_df, candidate_regions_df["cluster"].unique(), [],continuation_len_thr,conservation_thr,len(source_df),segment_size)
+
+        candidate_regions_df = extended_candidate_regions_df[extended_candidate_regions_df["cluster"].isin(clusters_in_final_df)]
+
+        #align the candidate regions and calculate their conservation score
+        (conserved_regions_positions,conserved_regions_dominant) = align_candidate_regions(candidate_regions_df)
+
+        return(conserved_regions_positions, conserved_regions_dominant)
+
     def extract_consensus_sequence_and_conserved_regions(self, folder_path):
         results = {}
         for file_name in os.listdir(folder_path):
@@ -1134,7 +1461,7 @@ class MarkerLociIdentificationStrategy(Strategy):
         Loops through species and their conserved regions, extracts corresponding parts of the consensus sequence,
         and runs minimap2 against a reference database for these sequences.
 
-        Parameters:
+        Parameters: hello itse me 
         - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
           conserved region positions, and dominant letters) as values.
         - reference_db: Path to the reference database used by minimap2.
