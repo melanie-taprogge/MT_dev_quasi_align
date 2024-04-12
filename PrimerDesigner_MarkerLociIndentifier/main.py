@@ -35,6 +35,12 @@ from Bio.Align import AlignInfo
 from tempfile import NamedTemporaryFile
 import re
 from Bio import Entrez
+import zipfile
+import requests
+import json
+from ncbi.datasets.openapi import ApiClient
+from ncbi.datasets.openapi.api.assembly_metadata_api import AssemblyMetadataApi
+from ncbi.datasets.openapi.api.genome_api import GenomeApi
 
 # Parsing the input FASTA file to a dictionary
 def parse_fasta_to_dict(fasta_file):
@@ -773,6 +779,185 @@ class MarkerLociIdentificationStrategy(Strategy):
         conn.commit()
         cur.close()
         conn.close()
+
+    def install_gatk(install_dir):
+        """
+        Download and install GATK (Genome Analysis Toolkit).
+
+        Parameters:
+        - install_dir: Path to the directory where GATK will be installed.
+        """
+        # Define the URL of the GATK release package
+        gatk_url = "https://github.com/broadinstitute/gatk/releases/download/4.5.0.0/gatk-4.5.0.0.zip"
+
+        # Create the installation directory if it doesn't exist
+        os.makedirs(install_dir, exist_ok=True)
+
+        # Download the GATK package
+        response = requests.get(gatk_url)
+        with open(os.path.join(install_dir, "gatk.zip"), "wb") as f:
+            f.write(response.content)
+
+        # Extract the downloaded package
+        with zipfile.ZipFile(os.path.join(install_dir, "gatk.zip"), "r") as zip_ref:
+            zip_ref.extractall(install_dir)
+
+        # Add execute permissions to the pgap-download tool
+        pgap_download_path = os.path.join(install_dir, "gatk-4.5.0.0", "pgap-download")
+        os.chmod(pgap_download_path, 0o755)
+
+        subprocess.run(["export", f"PATH=$PATH:{os.path.join(install_dir, 'gatk-4.5.0.0')}"], shell=True)
+
+    def download_pgap_database(self, output_dir):
+            """
+            Downloads the PGAP database from NCBI.
+
+            Parameters:
+            - output_dir: Directory where the downloaded PGAP database will be saved.
+            """
+            # Run the pgap-download tool to download the PGAP database
+            try:
+                subprocess.run(['pgap-download', '-o', output_dir], check=True)
+                print("PGAP database downloaded successfully.")
+            except subprocess.CalledProcessError as e:
+                print(f"Error downloading PGAP database: {e}")
+
+    def restore_pgap_database(self, database_name, dump_file_path):
+        """
+        Restore a PostgreSQL database from a dump file using pg_restore.
+
+        Parameters:
+        - database_name: The name of the PostgreSQL database to restore.
+        - dump_file_path: The path to the dump file containing the database dump.
+        """
+        # Command to restore the database using pg_restore
+        restore_command = [
+            'pg_restore', '--dbname', database_name, '--verbose', dump_file_path
+        ]
+
+        try:
+            # Execute the command
+            subprocess.run(restore_command, check=True)
+            print("Database restore completed successfully.")
+        except subprocess.CalledProcessError as e:
+            print(f"Error restoring database: {e}")
+
+    def check_existing_pgap_annotation(self, db_params, genome_name):
+        try:
+            # Connect to the PGAP database
+            conn = psycopg2.connect(**db_params)
+            cur = conn.cursor()
+
+            # Execute SQL query to search for records
+            cur.execute("SELECT * FROM annotated_genomes WHERE genome_name = %s", (genome_name,))
+            records = cur.fetchall()
+
+            # Check if any records were found
+            if records:
+                print(f"Annotation found for genome '{genome_name}'.")
+            else:
+                print(f"No annotation found for genome '{genome_name}'.")
+
+            # Clean up
+            cur.close()
+            conn.close()
+
+        except (Exception, psycopg2.DatabaseError) as error:
+            print("Error while connecting to PostgreSQL:", error)
+
+    def search_genome(self, email, species):
+        Entrez.email = email
+
+        # Define the database and construct the query
+        database = "genome"
+        query = f"{species}[Orgn] AND annotated[Title]"
+
+        # Perform the search
+        with Entrez.esearch(db=database, term=query, retmax=10) as handle:
+            search_results = Entrez.read(handle)
+
+        # Return the search results
+        return search_results
+
+    def fetch_genome_details(self, id_list):
+        with Entrez.efetch(db="genome", id=id_list, rettype="gb", retmode="text") as handle:
+            details = handle.read()
+        return details
+
+    def download_genome_data(tax_id, output_directory='genome_data'):
+        """
+        Download genome data for a given taxonomic ID using NCBI Datasets.
+
+        Parameters:
+        tax_id (str): Taxonomic ID of the species to download genome data for.
+        output_directory (str): Directory where the genome data will be saved.
+
+        Returns:
+        str: Path to the downloaded genome data file.
+        """
+        # Setup the API client
+        configuration = ApiClient()
+
+        # Initialize the Genome API
+        api_instance = GenomeApi(configuration)
+
+        try:
+            # Download genome data zip file
+            print(f"Downloading genome data for tax ID {tax_id}...")
+            api_response = api_instance.download_assembly_package(
+                taxon=tax_id,
+                include_sequence=True,
+                _preload_content=False
+            )
+
+            # Define the output file path
+            output_path = f"{output_directory}/ncbi_dataset_{tax_id}.zip"
+
+            # Write the response content to a file
+            with open(output_path, "wb") as out_file:
+                out_file.write(api_response.data)
+
+            print(f"Genome data downloaded successfully: {output_path}")
+            return output_path
+
+        except Exception as e:
+            print(f"An error occurred: {e}")
+            return None
+
+    def load_db_config(config_path):
+        """Load database configuration from a JSON file."""
+        with open(config_path, 'r') as file:
+            config = json.load(file)
+        return config
+
+    def query_local_database(species_name, config_path):
+        # Load database configuration from JSON file
+        config = load_db_config(config_path)
+
+        # Connect to your PostgreSQL database using the loaded credentials
+        conn = psycopg2.connect(
+            dbname=config['dbname'],
+            user=config['user'],
+            password=config['password'],
+            host=config['host']
+        )
+        cursor = conn.cursor()
+
+        # SQL query to find annotated genomes
+        query = """
+        SELECT * FROM genomes
+        WHERE species = %s AND annotation_available = True
+        """
+        cursor.execute(query, (species_name,))
+
+        # Fetch results
+        results = cursor.fetchall()
+
+        # Close the connection
+        cursor.close()
+        conn.close()
+
+        return results
 
     def extract_species_from_filename(self, genome_path):
         """
