@@ -1461,7 +1461,7 @@ class MarkerLociIdentificationStrategy(Strategy):
         Loops through species and their conserved regions, extracts corresponding parts of the consensus sequence,
         and runs minimap2 against a reference database for these sequences.
 
-        Parameters: hello itse me 
+        Parameters:
         - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
           conserved region positions, and dominant letters) as values.
         - reference_db: Path to the reference database used by minimap2.
