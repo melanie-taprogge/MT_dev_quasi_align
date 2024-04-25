@@ -1014,6 +1014,27 @@ class MarkerLociIdentificationStrategy(Strategy):
         # Save the filtered genes to a new file
         single_copy_core_genes.to_csv('path/to/output/single_copy_core_genes.csv', index=False)
 
+    def runMuscle(input_file,output_file):
+        """
+        Run muscle on an input file, creating an output file and return stdout and the stderr
+        """
+
+        # Command to run muscle
+        cmd = ["muscle", "-align", input_file, "-output", output_file]
+
+        try:
+            # Run the command and capture stdout and stderr
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+
+            stdout = stdout.decode('utf-8')
+            stderr = stderr.decode('utf-8')
+
+            return stdout, stderr
+
+        except subprocess.CalledProcessError as e:
+            return None, str(e), 1
+
     def align_sequences(self, input_file, alignment_tool='prank', output_format='fasta'):
         """
         Align sequences using a specified alignment tool.
@@ -1033,7 +1054,8 @@ class MarkerLociIdentificationStrategy(Strategy):
             stdout, stderr = clustalw_cline()
 
         elif alignment_tool.lower() == 'muscle':
-            muscle_cline = MuscleCommandline(input=input_file, out=output_file)
+            #muscle_cline = MuscleCommandline(input=input_file, out=output_file)
+            muscle_cline = runMuscle(input=input_file, out=output_file)
             stdout, stderr = muscle_cline()
 
         elif alignment_tool.lower() == 'mafft':
