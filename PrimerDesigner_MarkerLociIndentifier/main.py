@@ -1033,7 +1033,28 @@ class MarkerLociIdentificationStrategy(Strategy):
             return stdout, stderr
 
         except subprocess.CalledProcessError as e:
-            return None, str(e), 1
+            return None, str(e)
+        
+    def runClustalw(input_file,output_file): 
+        """
+        Run clustalw on an input file, creating an output file and return stdout and the stderr
+        """
+
+        # Command to run clustalw
+        cmd  = ['clustalw', '-INFILE=' + input_file, '-OUTFILE=' + output_file]
+
+        try:
+            # Run the command and capture stdout and stderr
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+
+            stdout = stdout.decode('utf-8')
+            stderr = stderr.decode('utf-8')
+
+            return stdout, stderr
+
+        except subprocess.CalledProcessError as e:
+            return None, str(e)
 
     def align_sequences(self, input_file, alignment_tool='prank', output_format='fasta'):
         """
@@ -1047,15 +1068,17 @@ class MarkerLociIdentificationStrategy(Strategy):
         Returns:
         - Path to the output alignment file.
         """
+
         output_file = f"{input_file.rsplit('.', 1)[0]}_{alignment_tool}.aln"
 
         if alignment_tool.lower() == 'clustalw':
-            clustalw_cline = ClustalwCommandline("clustalw2", infile=input_file, outfile=output_file)
+            #clustalw_cline = ClustalwCommandline("clustalw2", infile=input_file, outfile=output_file)
+            clustalw_cline = runClustalw(nfile=input_file, outfile=output_file)
             stdout, stderr = clustalw_cline()
 
         elif alignment_tool.lower() == 'muscle':
             #muscle_cline = MuscleCommandline(input=input_file, out=output_file)
-            muscle_cline = runMuscle(input=input_file, out=output_file)
+            muscle_cline = runMuscle(nfile=input_file, outfile=output_file)
             stdout, stderr = muscle_cline()
 
         elif alignment_tool.lower() == 'mafft':
