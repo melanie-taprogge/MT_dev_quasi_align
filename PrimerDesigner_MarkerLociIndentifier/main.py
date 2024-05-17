@@ -1014,6 +1014,70 @@ class MarkerLociIdentificationStrategy(Strategy):
         # Save the filtered genes to a new file
         single_copy_core_genes.to_csv('path/to/output/single_copy_core_genes.csv', index=False)
 
+    def runMuscle(self,input_file,output_file):
+        """
+        Run muscle on an input file, creating an output file and return stdout and the stderr
+        """
+
+        # Command to run muscle
+        cmd = ["muscle", "-align", input_file, "-output", output_file]
+
+        try:
+            # Run the command and capture stdout and stderr
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+
+            stdout = stdout.decode('utf-8')
+            stderr = stderr.decode('utf-8')
+
+            return stdout, stderr
+
+        except subprocess.CalledProcessError as e:
+            return None, str(e)
+        
+    def runClustalw(self,input_file,output_file): 
+        """
+        Run clustalw on an input file, creating an output file and return stdout and the stderr
+        """
+
+        # Command to run clustalw
+        cmd  = ['clustalw', '-INFILE=' + input_file, '-OUTFILE=' + output_file]
+
+        try:
+            # Run the command and capture stdout and stderr
+            process = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+
+            stdout = stdout.decode('utf-8')
+            stderr = stderr.decode('utf-8')
+
+            return stdout, stderr
+
+        except subprocess.CalledProcessError as e:
+            return None, str(e)
+        
+    def runMafft(self,input_file,output_file):
+
+        """
+        Run mafft on an input file, creating an output file and return stdout and the stderr
+        """
+
+        # Command to run mafft
+        cmd  = ['mafft', input_file, '>', output_file]
+
+        try:
+            # Run the command and capture stdout and stderr
+            process = subprocess.Popen(' '.join(cmd), shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            stdout, stderr = process.communicate()
+
+            stdout = stdout.decode('utf-8')
+            stderr = stderr.decode('utf-8')
+
+            return stdout, stderr
+
+        except subprocess.CalledProcessError as e:
+            return None, str(e)
+
     def align_sequences(self, input_file, alignment_tool='prank', output_format='fasta'):
         """
         Align sequences using a specified alignment tool.
@@ -1026,23 +1090,28 @@ class MarkerLociIdentificationStrategy(Strategy):
         Returns:
         - Path to the output alignment file.
         """
+
         output_file = f"{input_file.rsplit('.', 1)[0]}_{alignment_tool}.aln"
 
         if alignment_tool.lower() == 'clustalw':
-            clustalw_cline = ClustalwCommandline("clustalw2", infile=input_file, outfile=output_file)
+            #clustalw_cline = ClustalwCommandline("clustalw2", infile=input_file, outfile=output_file)
+            clustalw_cline = self.runClustalw(nfile=input_file, outfile=output_file)
             stdout, stderr = clustalw_cline()
 
         elif alignment_tool.lower() == 'muscle':
-            muscle_cline = MuscleCommandline(input=input_file, out=output_file)
+            #muscle_cline = MuscleCommandline(input=input_file, out=output_file)
+            muscle_cline = self.runMuscle(nfile=input_file, outfile=output_file)
             stdout, stderr = muscle_cline()
 
         elif alignment_tool.lower() == 'mafft':
-            mafft_cline = MafftCommandline(input=input_file)
-            stdout, stderr, = subprocess.Popen(str(mafft_cline),
-                                               stdout=subprocess.PIPE,
-                                               stderr=subprocess.PIPE,
-                                               shell=True,
-                                               text=True).communicate()
+            # mafft_cline = MafftCommandline(input=input_file)
+            # stdout, stderr, = subprocess.Popen(str(mafft_cline),
+            #                                    stdout=subprocess.PIPE,
+            #                                    stderr=subprocess.PIPE,
+            #                                    shell=True,
+            #                                    text=True).communicate()
+            mafft_cline = self.runMafft(nfile=input_file, outfile=output_file)
+            stdout, stderr = mafft_cline()
             with open(output_file, 'w') as f:
                 f.write(stdout)
 
