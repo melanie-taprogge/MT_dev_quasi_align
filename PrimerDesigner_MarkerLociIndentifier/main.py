@@ -41,6 +41,7 @@ import json
 from ncbi.datasets.openapi import ApiClient
 from ncbi.datasets.openapi.api.assembly_metadata_api import AssemblyMetadataApi
 from ncbi.datasets.openapi.api.genome_api import GenomeApi
+from collections import defaultdict
 
 # Parsing the input FASTA file to a dictionary
 def parse_fasta_to_dict(fasta_file):
@@ -1008,7 +1009,7 @@ class MarkerLociIdentificationStrategy(Strategy):
         gpa_df = pd.read_csv('path/to/panaroo/output/gene_presence_absence.csv')
 
         # Filter for single-copy core genes
-        presence_columns = gpa_df.columns[4:]  # Adjust based on your file
+        presence_columns = gpa_df.columns[4:]
         single_copy_core_genes = gpa_df.loc[(gpa_df[presence_columns] != '').sum(axis=1) == len(presence_columns)]
 
         # Save the filtered genes to a new file
@@ -1203,7 +1204,7 @@ class MarkerLociIdentificationStrategy(Strategy):
             2. The second list is a list of lists of dominant letters for each conserved region.
         """
         # Read the alignment
-        alignment = AlignIO.read(alignment_file, "fasta")  # Adjust the format if necessary
+        alignment = AlignIO.read(alignment_file, "fasta")
 
         # Generate a consensus sequence
         summary_align = AlignInfo.SummaryInfo(alignment)
@@ -1677,7 +1678,7 @@ class MarkerLociIdentificationStrategy(Strategy):
             for idx, region_positions in enumerate(conserved_regions_positions, start=1):
                 start, end = region_positions[0], region_positions[-1]  # Extract start and end from the positions list
                 # Extract the sequence part corresponding to the current conserved region using slicing
-                region_sequence = consensus_sequence[start - 1:end]  # Adjust if your positions are 1-based
+                region_sequence = consensus_sequence[start - 1:end]
                 # Create a unique key for each region including the species name, a two-digit index, and its start and end positions
                 region_key = f"{species_name}_{idx:02d}_{start}-{end}"
                 conserved_regions_dict[region_key] = region_sequence
@@ -2043,6 +2044,523 @@ class MarkerLociIdentificationStrategy(Strategy):
                 snps.append(i)
 
         return {'snps': snps, 'indels': indels}
+        
+    # Function to split multi-FASTA file and select random entries
+    def select_random_entries(self, fasta_file, num_entries=1000):
+        records = list(SeqIO.parse(fasta_file, "fasta"))
+        if len(records) <= num_entries:
+            return records
+        return random.sample(records, num_entries)
+        
+    def run_prokka_fast(self, directory="."):
+        # Loop over each file in the directory
+        for filename in os.listdir(directory):
+            if filename.endswith(".fasta"):
+                # Extract the species name from the filename
+                species_name = filename.replace('chromosome_sequences_', '').replace('.fasta', '')
+                
+                # Set the output directory for Prokka
+                output_dir = f"prokka_{species_name}"
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # Select n random entries or all if the number of entries < n (default n = 1000) from the multi-FASTA file
+                fasta_file = os.path.join(directory, filename)
+                selected_entries = select_random_entries(fasta_file)
+                
+                # Write each selected entry to a separate FASTA file and run Prokka
+                for i, entry in enumerate(selected_entries, 1):
+                    entry_filename = f"{species_name}_{i}.fasta"
+                    entry_filepath = os.path.join(output_dir, entry_filename)
+                    
+                    with open(entry_filepath, "w") as entry_file:
+                        SeqIO.write(entry, entry_file, "fasta")
+                    
+                    # Build the Prokka command
+                    prokka_cmd = [
+                        'prokka',
+                        '--kingdom', 'Bacteria',
+                        '--outdir', os.path.join(output_dir, f"entry_{i}"),
+                        '--prefix', f"{species_name}_{i}",
+                        '--cpus', "0",
+                        '--fast',
+                        entry_filepath
+                    ]
+                    
+                    # Execute the Prokka command
+                    try:
+                        print(f"Running Prokka for {species_name}_{i}...")
+                        subprocess.run(prokka_cmd, check=True)
+                        print(f"Prokka completed successfully for {species_name}_{i}")
+                    except subprocess.CalledProcessError as e:
+                        print(f"Prokka failed for {species_name}_{i}: {str(e)}")
+
+        # Print completion message
+        print("Processing of all files with Prokka is complete.")
+        
+    def run_prokka(self, directory="."):
+        # Loop over each file in the directory
+        for filename in os.listdir(directory):
+            if filename.endswith(".fasta"):
+                # Extract the species name from the filename
+                species_name = filename.replace('chromosome_sequences_', '').replace('.fasta', '')
+                
+                # Set the output directory for Prokka
+                output_dir = f"prokka_{species_name}"
+                os.makedirs(output_dir, exist_ok=True)
+                
+                # Select n random entries or all if the number of entries < n (default n = 1000) from the multi-FASTA file
+                fasta_file = os.path.join(directory, filename)
+                selected_entries = select_random_entries(fasta_file)
+                
+                # Write each selected entry to a separate FASTA file and run Prokka
+                for i, entry in enumerate(selected_entries, 1):
+                    entry_filename = f"{species_name}_{i}.fasta"
+                    entry_filepath = os.path.join(output_dir, entry_filename)
+                    
+                    with open(entry_filepath, "w") as entry_file:
+                        SeqIO.write(entry, entry_file, "fasta")
+                    
+                    # Build the Prokka command
+                    prokka_cmd = [
+                        'prokka',
+                        '--kingdom', 'Bacteria',
+                        '--outdir', os.path.join(output_dir, f"entry_{i}"),
+                        '--prefix', f"{species_name}_{i}",
+                        '--cpus', "0",
+                        entry_filepath
+                    ]
+                    
+                    # Execute the Prokka command
+                    try:
+                        print(f"Running Prokka for {species_name}_{i}...")
+                        subprocess.run(prokka_cmd, check=True)
+                        print(f"Prokka completed successfully for {species_name}_{i}")
+                    except subprocess.CalledProcessError as e:
+                        print(f"Prokka failed for {species_name}_{i}: {str(e)}")
+    
+    def gene_data_to_fasta(self, csv_file):
+        # Dictionary to store sequences by (species, gene) combination
+        sequences = defaultdict(list)
+        
+        with open(csv_file, 'r') as file:
+            reader = csv.reader(file)
+            header = next(reader)  # Skip the header row
+
+            for row in reader:
+                species_full = row[0]
+                dna_sequence = row[5]
+                gene_name = row[6]
+                
+                # Extract the species name (strip the second underscore and everything after it)
+                species_name = species_full.split('_')[0] + '_' + species_full.split('_')[1]
+
+                gene_name = gene_name.replace('/', '___')
+                
+                # Construct the file key
+                file_key = f"{species_name}_{gene_name}"
+                
+                # Prepare the FASTA header and sequence
+                fasta_header = f">{species_full}"
+                fasta_sequence = dna_sequence
+                
+                # Add to the dictionary
+                sequences[file_key].append((fasta_header, fasta_sequence))
+        
+        # Write each (species, gene) combination to a separate FASTA file
+        for file_key, seq_list in sequences.items():
+            with open(f"{file_key}.fasta", 'w') as fasta_file:
+                for header, sequence in seq_list:
+                    fasta_file.write(f"{header}\n")
+                    fasta_file.write(f"{sequence}\n")
+                    
+    def extract_sequences_and_run_blat(self, species_conservation_data, reference_db):
+        """
+        Loops through species and their conserved regions, extracts corresponding parts of the consensus sequence,
+        and runs BLAT against a reference database for these sequences.
+
+        Parameters:
+        - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - reference_db: Path to the reference database used by BLAT.
+        """
+        # Iterate over each species in the conservation data
+        for species, (consensus_seq, conserved_regions, _) in species_conservation_data.items():
+            print(f"Processing species: {species}")
+        
+            # Iterate over each conserved region for the current species
+            for idx, region_positions in enumerate(conserved_regions, start=1):
+                print(f"  Processing conserved region {idx} with positions: {region_positions}")
+        
+                # Extract the start and end positions of the conserved region
+                start_end_tuple = (region_positions[0], region_positions[-1])
+                start = start_end_tuple[0]
+                end = start_end_tuple[1]
+                print(f"    Extracting sequence from positions {start} to {end}")
+
+                # Extract the sequence part corresponding to the current conserved region
+                region_seq = consensus_seq[start:end + 1]
+                print(f"    Extracted sequence: {region_seq[:50]}...")  # Print the first 50 characters for brevity
+
+                # Create a temporary file to store the region sequence for BLAT input
+                temp_seq_file = f"temp_{species}_{start}_{end}.fasta"
+                print(f"    Writing sequence to temporary file: {temp_seq_file}")
+                with open(temp_seq_file, "w") as f:
+                    f.write(f">{species}_{start}_{end}\n{region_seq}\n")
+
+                # Define the output folder dynamically based on species and region
+                output_folder_specific = os.path.join("marker_loci/classification/blat")
+                print(f"    Ensuring output folder exists: {output_folder_specific}")
+                os.makedirs(output_folder_specific, exist_ok=True)
+
+                # Build the BLAT command
+                output_file = os.path.join(output_folder_specific, f"{species}_{idx:02d}_{start}_{end}_alignment.psl")
+                blat_cmd = ["blat", reference_db, temp_seq_file, output_file]
+                print(f"    Running BLAT with command: {' '.join(blat_cmd)}")
+
+                # Run BLAT
+                subprocess.run(blat_cmd)
+
+                # Remove the temporary sequence file after BLAT run
+                print(f"    Removing temporary file: {temp_seq_file}")
+                os.remove(temp_seq_file)
+
+    def extract_sequences_and_run_kraken2(self, species_conservation_data, kraken2_db, num_threads):
+        """
+        Loops through species and their conserved regions, finds the corresponding alignment files in the current directory,
+        extracts the part of the alignment specified by the conserved region, and runs Kraken2 against a reference database
+        for these sequences using multiple threads.
+
+        Parameters:
+        - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - kraken2_db: Path to the Kraken2 database.
+        - num_threads: Number of threads to use for Kraken2 classification.
+        """
+        # Ensure the output folder exists
+        output_folder_specific = os.path.join("marker_loci/classification/kraken2")
+        print(f"Ensuring output folder exists: {output_folder_specific}")
+        os.makedirs(output_folder_specific, exist_ok=True)
+
+        # Iterate over each species in the conservation data
+        for species, (consensus_seq, conserved_regions, _) in species_conservation_data.items():
+            print(f"Processing species: {species}")
+
+            # Find alignment files for the current species
+            alignment_files = glob.glob(f"./{species}*")
+            
+            for alignment_file in alignment_files:
+                print(f"  Found alignment file: {alignment_file}")
+
+                # Process each conserved region
+                for idx, region_positions in enumerate(conserved_regions, start=1):
+                    print(f"  Processing conserved region {idx} with positions: {region_positions}")
+                    
+                    # Extract the start and end positions of the conserved region
+                    start_end_tuple = (region_positions[0], region_positions[-1])
+                    start = start_end_tuple[0]
+                    end = start_end_tuple[1]
+                    print(f"    Extracting sequence from positions {start} to {end}")
+
+                    # Read the alignment file and extract the relevant part
+                    with open(alignment_file, "r") as infile:
+                        lines = infile.readlines()
+                    
+                    extracted_seq_file = f"temp_{species}_{start}_{end}.fasta"
+                    with open(extracted_seq_file, "w") as outfile:
+                        write_sequence = False
+                        for line in lines:
+                            if line.startswith(">"):
+                                header = line.strip()
+                                outfile.write(f"{header}_{start}_{end}\n")
+                                write_sequence = True
+                            elif write_sequence:
+                                seq_part = line.strip()[start:end+1]
+                                outfile.write(seq_part + "\n")
+
+                    # Define the output file for Kraken2
+                    base_filename = os.path.basename(alignment_file)
+                    output_file = os.path.join(output_folder_specific, f"{base_filename}_{idx:02d}_{start}_{end}_classification.txt")
+                    
+                    # Build the Kraken2 command
+                    kraken2_cmd = [
+                        "kraken2", 
+                        "--db", kraken2_db, 
+                        "--output", output_file, 
+                        "--report", output_file.replace('.txt', '_report.txt'), 
+                        "--threads", str(num_threads), 
+                        extracted_seq_file
+                    ]
+                    print(f"  Running Kraken2 with command: {' '.join(kraken2_cmd)}")
+
+                    # Run Kraken2
+                    subprocess.run(kraken2_cmd)
+
+                    # Remove the temporary sequence file after Kraken2 run
+                    print(f"  Removing temporary file: {extracted_seq_file}")
+                    os.remove(extracted_seq_file)
+
+    def extract_sequences_and_run_pblat(self, species_conservation_data, reference_db, num_cores):
+        """
+        Loops through species and their conserved regions, extracts corresponding parts of the consensus sequence,
+        and runs pBLAT against a reference database for these sequences using the specified number of cores.
+
+        Parameters:
+        - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - reference_db: Path to the reference database used by pBLAT.
+        - num_cores: Number of cores to use for pBLAT.
+        """
+        # Ensure the output folder exists
+        output_folder_specific = os.path.join("marker_loci/classification/pblat")
+        print(f"Ensuring output folder exists: {output_folder_specific}")
+        os.makedirs(output_folder_specific, exist_ok=True)
+
+        # Iterate over each species in the conservation data
+        for species, (consensus_seq, conserved_regions, _) in species_conservation_data.items():
+            print(f"Processing species: {species}")
+
+            # Iterate over each conserved region for the current species
+            for idx, region_positions in enumerate(conserved_regions, start=1):
+                print(f"  Processing conserved region {idx} with positions: {region_positions}")
+
+                # Extract the start and end positions of the conserved region
+                start_end_tuple = (region_positions[0], region_positions[-1])
+                start = start_end_tuple[0]
+                end = start_end_tuple[1]
+                print(f"    Extracting sequence from positions {start} to {end}")
+
+                # Extract the sequence part corresponding to the current conserved region
+                region_seq = consensus_seq[start:end + 1]
+                print(f"    Extracted sequence: {region_seq[:50]}...")  # Print the first 50 characters for brevity
+
+                # Create a temporary file to store the region sequence for pBLAT input
+                temp_seq_file = f"temp_{species}_{start}_{end}.fasta"
+                print(f"    Writing sequence to temporary file: {temp_seq_file}")
+                with open(temp_seq_file, "w") as f:
+                    f.write(f">{species}_{start}_{end}\n{region_seq}\n")
+
+                # Define the output file dynamically based on species and region
+                output_file = os.path.join(output_folder_specific, f"{species}_{idx:02d}_{start}_{end}_alignment.psl")
+
+                # Build the pBLAT command
+                pblat_cmd = ["pblat", "-threads=" + str(num_cores), reference_db, temp_seq_file, output_file]
+                print(f"    Running pBLAT with command: {' '.join(pblat_cmd)}")
+
+                # Run pBLAT
+                subprocess.run(pblat_cmd)
+
+                # Remove the temporary sequence file after pBLAT run
+                print(f"    Removing temporary file: {temp_seq_file}")
+                os.remove(temp_seq_file)
+
+    def extract_sequences_and_run_pblat_batch(self, species_conservation_data, reference_db, num_cores, min_identity=98):
+        """
+        Collects all query sequences and runs pBLAT against a reference database for these sequences using the specified number of cores.
+
+        Parameters:
+        - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - reference_db: Path to the reference database used by pBLAT.
+        - num_cores: Number of cores to use for pBLAT.
+        - min_identity:  Minimum sequence identity for pBLAT alignments.
+        """
+        # Ensure the output folder exists
+        output_folder_specific = os.path.join("marker_loci/classification/pblat")
+        print(f"Ensuring output folder exists: {output_folder_specific}")
+        os.makedirs(output_folder_specific, exist_ok=True)
+
+        # Create a temporary file to store all region sequences for pBLAT input
+        combined_seq_file = "combined_temp_sequences.fasta"
+        with open(combined_seq_file, "w") as combined_f:
+            # Iterate over each species in the conservation data
+            for species, (consensus_seq, conserved_regions, _) in species_conservation_data.items():
+                print(f"Processing species: {species}")
+
+                # Iterate over each conserved region for the current species
+                for idx, region_positions in enumerate(conserved_regions, start=1):
+                    print(f"  Processing conserved region {idx} with positions: {region_positions}")
+
+                    # Extract the start and end positions of the conserved region
+                    start_end_tuple = (region_positions[0], region_positions[-1])
+                    start = start_end_tuple[0]
+                    end = start_end_tuple[1]
+                    print(f"    Extracting sequence from positions {start} to {end}")
+
+                    # Extract the sequence part corresponding to the current conserved region
+                    region_seq = consensus_seq[start:end + 1]
+                    print(f"    Extracted sequence: {region_seq[:50]}...")  # Print the first 50 characters for brevity
+
+                    # Write the region sequence to the combined temporary file for pBLAT input
+                    combined_f.write(f">{species}_{start}_{end}\n{region_seq}\n")
+
+        # Define the output file for pBLAT
+        output_file = os.path.join(output_folder_specific, "combined_alignment.psl")
+
+        # Build the pBLAT command
+        pblat_cmd = ["pblat", "-threads=" + str(num_cores), "-minIdentity=" + str(min_identity), reference_db, combined_seq_file, output_file]
+        print(f"Running pBLAT with command: {' '.join(pblat_cmd)}")
+
+        # Run pBLAT
+        subprocess.run(pblat_cmd)
+
+        # Remove the combined temporary sequence file after pBLAT run
+        print(f"Removing temporary file: {combined_seq_file}")
+        os.remove(combined_seq_file)
+
+    def extract_sequences_and_run_pblat_batch_partitioned_db(self, species_conservation_data, reference_db_dir, num_cores, min_identity):
+        """
+        Collects all query sequences and runs pBLAT against each partition of a reference database using the specified number of cores.
+
+        Parameters:
+        - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - reference_db_dir: Directory containing the partitioned reference database files in .2bit format.
+        - num_cores: Number of cores to use for pBLAT.
+        - min_identity: Minimum sequence identity for pBLAT alignments.
+        """
+        # Ensure the output folder exists
+        output_folder_specific = os.path.join("marker_loci/classification/pblat")
+        print(f"Ensuring output folder exists: {output_folder_specific}")
+        os.makedirs(output_folder_specific, exist_ok=True)
+
+        # Create a temporary file to store all region sequences for pBLAT input
+        combined_seq_file = "combined_temp_sequences.fasta"
+        with open(combined_seq_file, "w") as combined_f:
+            # Iterate over each species in the conservation data
+            for species, (consensus_seq, conserved_regions, _) in species_conservation_data.items():
+                print(f"Processing species: {species}")
+
+                # Iterate over each conserved region for the current species
+                for idx, region_positions in enumerate(conserved_regions, start=1):
+                    print(f"  Processing conserved region {idx} with positions: {region_positions}")
+
+                    # Extract the start and end positions of the conserved region
+                    start_end_tuple = (region_positions[0], region_positions[-1])
+                    start = start_end_tuple[0]
+                    end = start_end_tuple[1]
+                    print(f"    Extracting sequence from positions {start} to {end}")
+
+                    # Extract the sequence part corresponding to the current conserved region
+                    region_seq = consensus_seq[start:end + 1]
+                    print(f"    Extracted sequence: {region_seq[:50]}...")  # Print the first 50 characters for brevity
+
+                    # Write the region sequence to the combined temporary file for pBLAT input
+                    combined_f.write(f">{species}_{start}_{end}\n{region_seq}\n")
+
+        # Iterate over each partitioned reference database file
+        for ref_db_part in os.listdir(reference_db_dir):
+            if ref_db_part.endswith(".2bit"):
+                ref_db_path = os.path.join(reference_db_dir, ref_db_part)
+
+                # Define the output file for pBLAT
+                output_file = os.path.join(output_folder_specific, f"combined_alignment_{ref_db_part}.psl")
+
+                # Build the pBLAT command
+                pblat_cmd = ["pblat", "-threads=" + str(num_cores), "-minIdentity=" + str(min_identity), ref_db_path, combined_seq_file, output_file]
+                print(f"Running pBLat for {ref_db_part} with command: {' '.join(pblat_cmd)}")
+
+                # Run pBLAT
+                subprocess.run(pblat_cmd)
+
+        # Remove the combined temporary sequence file after all pBLAT runs
+        print(f"Removing temporary file: {combined_seq_file}")
+        os.remove(combined_seq_file)
+        
+    def extract_sequences_and_run_pblat_batch_partitioned(self, species_conservation_data, reference_db, num_cores):
+        """
+        Collects all query sequences and runs pBLAT against a reference database for these sequences using the specified number of cores.
+        The sequences are split into four parts and processed in four separate pBLAT runs.
+
+        Parameters:
+        - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - reference_db: Path to the reference database used by pBLAT.
+        - num_cores: Number of cores to use for pBLAT.
+        """
+        # Ensure the output folder exists
+        output_folder_specific = os.path.join("marker_loci/classification/pblat")
+        print(f"Ensuring output folder exists: {output_folder_specific}")
+        os.makedirs(output_folder_specific, exist_ok=True)
+
+        # Collect all sequences into a list
+        sequences = []
+        for species, (consensus_seq, conserved_regions, _) in species_conservation_data.items():
+            print(f"Processing species: {species}")
+
+            for idx, region_positions in enumerate(conserved_regions, start=1):
+                print(f"  Processing conserved region {idx} with positions: {region_positions}")
+
+                start_end_tuple = (region_positions[0], region_positions[-1])
+                start = start_end_tuple[0]
+                end = start_end_tuple[1]
+                print(f"    Extracting sequence from positions {start} to {end}")
+
+                region_seq = consensus_seq[start:end + 1]
+                print(f"    Extracted sequence: {region_seq[:50]}...")  # Print the first 50 characters for brevity
+
+                sequences.append(f">{species}_{start}_{end}\n{region_seq}\n")
+
+        # Split sequences into four parts
+        num_sequences = len(sequences)
+        part_size = ceil(num_sequences / 4)
+
+        for i in range(4):
+            part_sequences = sequences[i * part_size:(i + 1) * part_size]
+            part_file = f"combined_temp_sequences_part_{i+1}.fasta"
+            
+            with open(part_file, "w") as part_f:
+                part_f.writelines(part_sequences)
+
+            # Define the output file for pBLAT
+            output_file = os.path.join(output_folder_specific, f"combined_alignment_part_{i+1}.psl")
+
+            # Build the pBLAT command
+            pblat_cmd = ["pblat", "-threads=" + str(num_cores), reference_db, part_file, output_file]
+            print(f"Running pBLAT for part {i+1} with command: {' '.join(pblat_cmd)}")
+
+            # Run pBLAT
+            subprocess.run(pblat_cmd)
+
+            # Remove the part temporary sequence file after pBLAT run
+            print(f"Removing temporary file: {part_file}")
+            # os.remove(part_file)
+
+    def process_conservation_data(self, species_conservation_data, folder_path="."):
+        """
+        Processes the species conservation data by finding consensus sequences for related regions and appending new entries
+        to the output dictionary.
+
+        Parameters:
+        - species_conservation_data: Dictionary with species names as keys and 3-tuples (consensus sequence,
+          conserved region positions, and dominant letters) as values.
+        - folder_path: Path to the directory containing .aln files. Default is the current directory.
+
+        Returns:
+        - Dictionary with updated entries including consensus sequences for related regions.
+        """
+        output_data = {}
+
+        for key, (consensus_sequence, conserved_regions, dominant_letters) in species_conservation_data.items():
+            # Extract region_name and current_species_name from the key
+            parts = key.split("_")
+            region_name = "_".join(parts[2:])
+            current_species_name = "_".join(parts[:2])
+
+            for file_name in os.listdir(folder_path):
+                if file_name.endswith(".aln") and region_name in file_name and current_species_name not in file_name:
+                    alignment_file = os.path.join(folder_path, file_name)
+
+                    # Find the consensus sequence for the alignment file
+                    new_consensus_sequence = self.get_consensus_sequence_from_alignment(alignment_file)
+
+                    # Build the new key
+                    new_species_name = "_".join(file_name.split("_")[:2])
+                    new_key = f"{current_species_name}_{region_name}_{new_species_name}"
+
+                    # Append the new entry to the output dictionary
+                    output_data[new_key] = (new_consensus_sequence, conserved_regions, dominant_letters)
+
+        return output_data
 
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
