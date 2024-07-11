@@ -2621,6 +2621,52 @@ class MarkerLociIdentificationStrategy(Strategy):
         df = pd.DataFrame(data, columns=["region", "species", "conserved_regions"])
         return df
 
+    def find_high_entropy_regions(self, alignment, threshold=1.4, alpha=2, min_length=3):
+        frequencies = self.calculate_frequencies(alignment)
+        num_positions = alignment.get_alignment_length()
+        
+        entropy_values = [self.renyi_entropy(freq, alpha) for freq in frequencies]
+        
+        regions = []
+        in_region = False
+        start = None
+        region_entropies = []
+
+        for i in range(num_positions):
+            if entropy_values[i] is not None:
+                if entropy_values[i] > threshold:
+                    if not in_region:
+                        start = i
+                        in_region = True
+                        region_entropies = [entropy_values[i]]
+                    else:
+                        region_entropies.append(entropy_values[i])
+                    avg_entropy = sum(region_entropies) / len(region_entropies)
+                    if avg_entropy <= threshold:
+                        in_region = False
+                        if i - start >= min_length:
+                            regions.append((start, i - 1))
+                else:
+                    if in_region:
+                        avg_entropy = sum(region_entropies) / len(region_entropies)
+                        if avg_entropy > threshold:
+                            in_region = False
+                            if i - start >= min_length:
+                                regions.append((start, i - 1))
+            else:
+                if in_region:
+                    avg_entropy = sum(region_entropies) / len(region_entropies)
+                    if avg_entropy > threshold:
+                        in_region = False
+                        if i - start >= min_length:
+                            regions.append((start, i - 1))
+
+        # Check if the last region extends to the end
+        if in_region and num_positions - start >= min_length:
+            regions.append((start, num_positions - 1))
+
+        return regions
+
     def find_low_entropy_regions(self, alignment, threshold=0.2, alpha=2, min_length=3):
         frequencies = self.calculate_frequencies(alignment)
         num_positions = alignment.get_alignment_length()
@@ -2666,6 +2712,8 @@ class MarkerLociIdentificationStrategy(Strategy):
             regions.append((start, num_positions - 1))
 
         return regions
+
+    
 
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
