@@ -2713,7 +2713,50 @@ class MarkerLociIdentificationStrategy(Strategy):
 
         return regions
 
-    
+    def find_cross_species_conserved_and_variable_regions(self, filepath, min_length=3):
+        data = []
+        
+        # Read the alignment file
+        alignment = AlignIO.read(filepath, "fasta")
+        
+        # Parse the filename to extract region
+        filename = os.path.basename(filepath)
+        
+        # Step 1: Remove the file extension
+        base_filename = filename.rsplit(".", 1)[0]
+        # base_filename = 'genus_species_some_region_with_underscores'
+
+        # Step 2: Split the base filename by underscores
+        parts = base_filename.split("_")
+        # parts = ['genus', 'species', 'some', 'region', 'with', 'underscores']
+
+        # Step 3: The region starts after the genus and species names
+        region = "_".join(parts[2:])
+        # region = 'some_region_with_underscores'
+        
+        # Extract species names
+        species_names = set()
+        for record in alignment:
+            species_name = "_".join(record.id.split("_")[:2])
+            species_names.add(species_name)
+        
+        # Find variable regions with high entropy
+        high_entropy_regions = self.find_high_entropy_regions(alignment, threshold=1.2, alpha=2, min_length=min_length)
+        
+        # Find conserved regions with low entropy
+        low_entropy_regions = self.find_low_entropy_regions(alignment, threshold=0.4, alpha=2, min_length=min_length)
+        
+        # Append the result to the data list
+        data.append({
+            "region": region,
+            "species": species_names,
+            "variable_regions": high_entropy_regions,
+            "conserved_regions": low_entropy_regions
+        })
+        
+        # Create a DataFrame from the data list
+        df = pd.DataFrame(data, columns=["region", "species", "variable_regions", "conserved_regions"])
+        return df
 
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
