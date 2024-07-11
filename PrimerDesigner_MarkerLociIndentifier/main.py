@@ -2594,6 +2594,79 @@ class MarkerLociIdentificationStrategy(Strategy):
             sum_p_alpha = sum(p ** alpha for p in frequencies.values())
             return (1 / (1 - alpha)) * np.log2(sum_p_alpha)
 
+    def find_species_conserved_regions(self, directory="separate_species"):
+        data = []
+        
+        for filename in os.listdir(directory):
+            if filename.endswith(".aln"):
+                filepath = os.path.join(directory, filename)
+                alignment = AlignIO.read(filepath, "fasta")
+                
+                # Parse the filename to extract species_name and region
+                parts = filename.split("_")
+                species_name = "_".join(parts[:2])
+                region = "_".join(parts[2:]).rsplit("_", 1)[0]
+                
+                # Find conserved regions
+                conserved_regions = self.find_low_entropy_regions(alignment, threshold=0.3, alpha=1.5)
+                
+                # Append the result to the data list
+                data.append({
+                    "region": region,
+                    "species": species_name,                    
+                    "conserved_regions": conserved_regions
+                })
+        
+        # Create a DataFrame from the data list
+        df = pd.DataFrame(data, columns=["region", "species", "conserved_regions"])
+        return df
+
+    def find_low_entropy_regions(self, alignment, threshold=0.2, alpha=2, min_length=3):
+        frequencies = self.calculate_frequencies(alignment)
+        num_positions = alignment.get_alignment_length()
+        
+        entropy_values = [self.renyi_entropy(freq, alpha) for freq in frequencies]
+        
+        regions = []
+        in_region = False
+        start = None
+        region_entropies = []
+
+        for i in range(num_positions):
+            if entropy_values[i] is not None:
+                if entropy_values[i] <= threshold:
+                    if not in_region:
+                        start = i
+                        in_region = True
+                        region_entropies = [entropy_values[i]]
+                    else:
+                        region_entropies.append(entropy_values[i])
+                    avg_entropy = sum(region_entropies) / len(region_entropies)
+                    if avg_entropy > threshold:
+                        in_region = False
+                        if i - start >= min_length:
+                            regions.append((start, i - 1))
+                else:
+                    if in_region:
+                        avg_entropy = sum(region_entropies) / len(region_entropies)
+                        if avg_entropy <= threshold:
+                            in_region = False
+                            if i - start >= min_length:
+                                regions.append((start, i - 1))
+            else:
+                if in_region:
+                    avg_entropy = sum(region_entropies) / len(region_entropies)
+                    if avg_entropy > threshold:
+                        in_region = False
+                        if i - start >= min_length:
+                            regions.append((start, i - 1))
+
+        # Check if the last region extends to the end
+        if in_region and num_positions - start >= min_length:
+            regions.append((start, num_positions - 1))
+
+        return regions
+
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
         save_optimal_markers_to_csv()
