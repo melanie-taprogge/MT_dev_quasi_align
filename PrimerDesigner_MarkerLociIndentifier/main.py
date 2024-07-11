@@ -2562,6 +2562,38 @@ class MarkerLociIdentificationStrategy(Strategy):
 
         return output_data
 
+    def calculate_frequencies(self, alignment):
+        num_sequences = len(alignment)
+        num_positions = alignment.get_alignment_length()
+        frequencies = []
+
+        for pos in range(num_positions):
+            nucleotide_counts = defaultdict(float)
+            total_count = 0  # To count only valid nucleotides
+
+            for record in alignment:
+                nucleotide = record.seq[pos]
+                if nucleotide not in ['-', 'N']:
+                    nucleotide_counts[nucleotide] += 1
+                    total_count += 1
+
+            # Normalize frequencies
+            for nucleotide in nucleotide_counts:
+                nucleotide_counts[nucleotide] /= total_count
+
+            frequencies.append(nucleotide_counts)
+
+        return frequencies
+
+    def renyi_entropy(self, frequencies, alpha=2):
+        if frequencies is None:
+            return None  # Skip positions with only gaps and Ns
+        if alpha == 1:
+            return -sum(p * np.log2(p) for p in frequencies.values() if p > 0)
+        else:
+            sum_p_alpha = sum(p ** alpha for p in frequencies.values())
+            return (1 / (1 - alpha)) * np.log2(sum_p_alpha)
+
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
         save_optimal_markers_to_csv()
