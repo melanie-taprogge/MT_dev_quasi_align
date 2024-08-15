@@ -2757,6 +2757,55 @@ class MarkerLociIdentificationStrategy(Strategy):
         # Create a DataFrame from the data list
         df = pd.DataFrame(data, columns=["region", "species", "variable_regions", "conserved_regions"])
         return df
+        
+    def process_cross_species_alignments(self, directory="."):
+        all_data = []
+        
+        for filename in os.listdir(directory):
+            if filename.endswith(".fas"):
+                filepath = os.path.join(directory, filename)
+                alignment = AlignIO.read(filepath, "fasta")
+
+                # Parse the filename to extract region
+                filename = os.path.basename(filepath)                
+                
+                print(f"processing {filepath}")
+                
+                # Extract species names
+                species_names = set("_".join(record.id.split("_")[:2]) for record in alignment)
+
+                # Step 1: Remove the file extension
+                region = filename.rsplit(".", 1)[0]
+                # base_filename = 'genus_species_some_region_with_underscores'
+                
+                # Step 2: Split the base filename by underscores
+                # parts = base_filename.split("_")
+                # parts = ['genus', 'species', 'some', 'region', 'with', 'underscores']
+
+                # Step 3: The region starts after the genus and species names
+                # region = "_".join(parts[2:])
+                # region = 'some_region_with_underscores'
+                
+                # Generate all combinations of species names of different lengths
+                for r in range(2, len(species_names) + 1):
+                    for combination in itertools.combinations(species_names, r):
+                        # print(combination)
+
+                        # Create a temporary file for this combination
+                        temp_alignment = [record for record in alignment if "_".join(record.id.split("_")[:2]) in combination]
+                        temp_filename = f"tmp/species_combination_{region}.aln"
+                        with open(temp_filename, "w") as temp_file:
+                            write(temp_alignment, temp_file, "fasta")
+                        
+                        # Run the analysis function
+                        df = self.find_cross_species_conserved_and_variable_regions(temp_filename)
+                        
+                        # Append the result to the all_data list
+                        all_data.append(df)
+        
+        # Combine all the data into a single DataFrame
+        result_df = pd.concat(all_data, ignore_index=True)
+        return result_df
 
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
