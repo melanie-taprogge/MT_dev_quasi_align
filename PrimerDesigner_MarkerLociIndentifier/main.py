@@ -2806,6 +2806,30 @@ class MarkerLociIdentificationStrategy(Strategy):
         # Combine all the data into a single DataFrame
         result_df = pd.concat(all_data, ignore_index=True)
         return result_df
+        
+    def merge_species_and_cross_species_conservation_data(self, df1, df2):
+        # Create a new column in df1 to store the list of lists of conserved regions for each species
+        df1["species_conserved_regions"] = None
+
+        # Iterate over the rows of df1
+        for i, row in df1.iterrows():
+            region = row["region"]
+            species_set = row["species"]
+            
+            species_conserved_regions = []
+            
+            # For each species in the set, find the corresponding row in df2 and get the conserved regions
+            for species in species_set:
+                matching_rows = df2[(df2["species"] == species) & (df2["region"] == region)]
+                
+                # There should be only one matching row for each species and region
+                for _, match in matching_rows.iterrows():
+                    species_conserved_regions.append(match["conserved_regions"])
+            
+            # Store the list of lists in the new column
+            df1.at[i, "species_conserved_regions"] = species_conserved_regions
+        
+        return df1
 
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
