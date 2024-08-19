@@ -2831,6 +2831,14 @@ class MarkerLociIdentificationStrategy(Strategy):
         
         return df1
 
+    # Function to convert string to list of tuples
+    def convert_string_to_object(self, string):
+        try:
+            return ast.literal_eval(string)
+        except (ValueError, SyntaxError) as e:
+            print(f"Error converting string to object: {string}")
+            return []
+
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
         save_optimal_markers_to_csv()
