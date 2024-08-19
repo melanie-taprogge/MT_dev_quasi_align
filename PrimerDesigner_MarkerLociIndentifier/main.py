@@ -2839,6 +2839,29 @@ class MarkerLociIdentificationStrategy(Strategy):
             print(f"Error converting string to object: {string}")
             return []
 
+    # Function to merge adjacent regions
+    def merge_adjacent_regions(self, regions, gap=5):
+        if not regions:
+            return []
+        
+        # Sort regions by start position
+        regions = sorted(regions, key=lambda x: x[0])
+        combined_regions = []
+        current_region = regions[0]
+
+        for start, end in regions[1:]:
+            if start - current_region[1] <= gap:
+                # Merge regions
+                current_region = (current_region[0], max(current_region[1], end))
+            else:
+                # Add current region to combined regions and start a new region
+                combined_regions.append(current_region)
+                current_region = (start, end)
+        
+        # Add the last region
+        combined_regions.append(current_region)
+        return combined_regions
+
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
         save_optimal_markers_to_csv()
