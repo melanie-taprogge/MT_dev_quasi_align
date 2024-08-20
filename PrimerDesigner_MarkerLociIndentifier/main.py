@@ -2884,6 +2884,12 @@ class MarkerLociIdentificationStrategy(Strategy):
     def filter_regions_by_length(self, regions, min_length):
         return [region for region in regions if region[1] - region[0] + 1 >= min_length]
 
+    # Function to process the DataFrame
+    def filter_candidate_marker_regions(self, df, min_length):
+        df = df.copy()  # Ensure we are working with a copy of the DataFrame
+        df.loc[:, 'candidate_marker_regions_filtered'] = df['candidate_marker_regions'].apply(lambda x: self.filter_regions_by_length(x, min_length))
+        return df
+
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
         save_optimal_markers_to_csv()
