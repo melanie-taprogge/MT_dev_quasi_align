@@ -2862,6 +2862,16 @@ class MarkerLociIdentificationStrategy(Strategy):
         combined_regions.append(current_region)
         return combined_regions
 
+    # Function to process the DataFrame
+    def combine_variable_regions(self, df, gap=5):
+        df['variable_regions_combined'] = df['variable_regions'].apply(lambda x: self.merge_adjacent_regions(x, gap))
+        return df
+
+    # Function to process the DataFrame
+    def combine_conserved_regions(self, df, gap=5):
+        df['conserved_regions_combined'] = df['conserved_regions'].apply(lambda x: self.merge_adjacent_regions(x, gap))
+        return df
+
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
         save_optimal_markers_to_csv()
