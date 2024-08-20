@@ -2880,6 +2880,10 @@ class MarkerLociIdentificationStrategy(Strategy):
         df['species_conserved_regions_combined'] = df['species_conserved_regions'].apply(combine_species_regions)
         return df
 
+    # Function to filter regions based on minimum length
+    def filter_regions_by_length(self, regions, min_length):
+        return [region for region in regions if region[1] - region[0] + 1 >= min_length]
+
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
         save_optimal_markers_to_csv()
