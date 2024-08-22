@@ -2889,6 +2889,64 @@ class MarkerLociIdentificationStrategy(Strategy):
         df = df.copy()  # Ensure we are working with a copy of the DataFrame
         df.loc[:, 'candidate_marker_regions_filtered'] = df['candidate_marker_regions'].apply(lambda x: self.filter_regions_by_length(x, min_length))
         return df
+        
+    def intersect_two_regions(self, region1, region2):
+        """Find the intersection of two regions."""
+        try:
+            start1, end1 = region1
+            start2, end2 = region2
+        except ValueError as e:
+            print(f"Error unpacking regions: {region1}, {region2}")
+            raise e
+        if end1 < start2 or end2 < start1:
+            return None  # No overlap
+        return (max(start1, start2), min(end1, end2))
+
+    def find_intersection(self, regions):
+        """Find the intersection of multiple lists of regions."""
+        if not regions:
+            return []
+
+        # Initialize with the first list of regions
+        intersection = regions[0]
+        # print(f"regions = {regions}")
+        # print(f"{intersection}")
+        for other_regions in regions[1:]:
+            new_intersection = []
+            for region1 in intersection:
+                for region2 in other_regions:
+                    # print(f"region1 = {region1}")
+                    # print(f"region2 = {region2}")
+                    intersected_region = self.intersect_two_regions(region1, region2)
+                    if intersected_region:
+                        new_intersection.append(intersected_region)
+            intersection = new_intersection
+
+            # If at any point the intersection is empty, we can return immediately
+            if not intersection:
+                return []
+
+        return sorted(intersection)
+
+    def calculate_intersections(self, df):
+        df['species_conserved_regions_intersection'] = df['species_conserved_regions'].apply(self.find_intersection)
+        return df
+
+    # Function to calculate intersections between species_conserved_regions_intersection and variable_regions
+    def intersect_region_lists(self, list1, list2):
+        """Find the intersection of two lists of regions."""
+        intersections = []
+        for region1 in list1:
+            for region2 in list2:
+                intersected_region = self.intersect_two_regions(region1, region2)
+                if intersected_region:
+                    intersections.append(intersected_region)
+        return sorted(intersections)
+
+    def calculate_candidate_marker_regions(self, df):
+        df['candidate_marker_regions'] = df.apply(
+            lambda row: self.intersect_region_lists(row['species_conserved_regions_intersection'], row['variable_regions']), axis=1)
+        return df
 
     def identify_markers(self, ):
         self.species_markers = filter_candidate_species_markers()
